@@ -5,7 +5,8 @@
 // The failures that make a real call fail, and so refund its charge:
 //   - an output that doesn't match the service's output schema, which the
 //     gateway treats as the provider not delivering;
-//   - an endpoint that errors, redirects, times out, or answers without JSON.
+//   - an endpoint that errors, redirects, times out, or answers without JSON;
+//   - an output larger than the 4 MB of JSON Varis can deliver.
 // It also proves the handler's verifyRequest is wired correctly, because the
 // request is signed and checked the same way a real one is.
 //
@@ -52,6 +53,7 @@ import {
   type FailureCause,
   judgeAnswer,
   judgeError,
+  MAX_OUTPUT_BYTES,
   type Outcome,
   PROVIDER_TIMEOUT_MS,
 } from "../lib/test-outcome.ts";
@@ -423,6 +425,15 @@ function reportFailure(
       return reportUnreachable(call.target, keyFetches, output);
     case "status":
       return reportStatus(cause.response, cause.text, keyFetches, output);
+    case "too_large":
+      output.err(
+        failure(
+          output,
+          `Your server's output is ${formatMegabytes(cause.bytes)} of JSON. Varis delivers at most ${formatMegabytes(MAX_OUTPUT_BYTES)}, so it would fail this call as output_too_large and refund it.`,
+        ),
+      );
+      output.err("Return a large result as a URL to your own storage instead.");
+      return 1;
     case "not_json":
       output.err(
         failure(
@@ -586,6 +597,12 @@ function reportStatus(
 
   if (text.trim() !== "") showBody(text, output);
   return 1;
+}
+
+/** Bytes as megabytes, for example "4.2 MB". */
+function formatMegabytes(bytes: number): string {
+  const megabytes = bytes / (1024 * 1024);
+  return `${Number.isInteger(megabytes) ? megabytes : megabytes.toFixed(1)} MB`;
 }
 
 function printProblems(problems: SchemaProblem[], output: Output): void {

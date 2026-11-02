@@ -273,6 +273,21 @@ describe("varis test", () => {
     expect(result.err).toContain('"temp_c": "warm"');
   });
 
+  it("fails an output over 4 MB, as the gateway does, before checking its shape", async () => {
+    // Valid JSON matching the schema, but too large to deliver.
+    const big = JSON.stringify({ temp_c: 1, padding: "x".repeat(4 * 1024 * 1024) });
+    const p = provider(keyPort, () => ({ status: 200, body: big }));
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.out).toBe("");
+    expect(result.err).toContain("output_too_large");
+    expect(result.err).toContain("at most 4 MB");
+    expect(result.err).toContain("as a URL to your own storage");
+  });
+
   it("reports an answer that isn't JSON", async () => {
     const p = provider(keyPort, () => ({ status: 200, body: "<html>hi</html>" }));
     await manifest(await start(p));

@@ -11,8 +11,19 @@ import { type SchemaProblem, validate } from "./schema.ts";
 /** The gateway gives a provider this long to answer, body included. */
 export const PROVIDER_TIMEOUT_MS = 30_000;
 
+/**
+ * The largest output Varis delivers, as JSON text. Vercel caps a function's
+ * response body at 4.5 MB, so the gateway fails a larger output as
+ * output_too_large (D35). MAX_OUTPUT_BYTES in the varis repository.
+ */
+export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
+
 /** The reasons a real call would be recorded as failed, as the gateway names them. */
-export type FailureReason = "timeout" | "provider_error" | "schema_violation";
+export type FailureReason =
+  | "timeout"
+  | "provider_error"
+  | "schema_violation"
+  | "output_too_large";
 
 /** Why the call failed, in enough detail to explain it. */
 export type FailureCause =
@@ -22,6 +33,8 @@ export type FailureCause =
   | { kind: "unreachable"; error: unknown }
   /** A redirect or an error status. */
   | { kind: "status"; response: Response; text: string }
+  /** An output over MAX_OUTPUT_BYTES, which Varis can't deliver. */
+  | { kind: "too_large"; bytes: number }
   | { kind: "not_json"; statusCode: number; text: string }
   | { kind: "schema_mismatch"; problems: SchemaProblem[]; payload: unknown }
   /** The output schema itself doesn't compile. Publish would refuse it. */
@@ -43,6 +56,12 @@ export function judgeAnswer(
       ? "timeout"
       : "provider_error";
     return failed(reason, { kind: "status", response, text });
+  }
+
+  // Checked before parsing: Varis couldn't deliver it, whatever its shape.
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes > MAX_OUTPUT_BYTES) {
+    return failed("output_too_large", { kind: "too_large", bytes });
   }
 
   let payload: unknown;
