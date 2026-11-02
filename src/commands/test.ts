@@ -30,8 +30,15 @@
 //      checks that signature against. src/lib/test-signing.ts explains how,
 //      and why that's safe.
 //   6. Sends it, with the gateway's 30-second timeout and no redirects.
-//   7. Validates the response against the output schema, and prints the
-//      output, or exactly what would make a real call fail.
+//   7. Judges the answer as the gateway does (src/lib/test-outcome.ts):
+//      validates it against the output schema, and prints the output, or
+//      exactly what would make a real call fail.
+//   8. For a call the server accepts, by answering 202 started or by sending
+//      a started notification before it answers (D26), waits for the result
+//      by notification. It prints each notification, judges each as Varis
+//      would (src/lib/test-notifications.ts), and validates the result as in
+//      step 7. There's no time limit, but as in production, 5 minutes without
+//      a notification fails the call.
 //
 // It reads varis.json as it is and doesn't run varis build first, so a test
 // is instant. After changing a definition, run varis build, then test.
@@ -49,12 +56,17 @@ import type { Output } from "../lib/output.ts";
 import { toQueryString } from "../lib/query-string.ts";
 import { type SchemaProblem, validate } from "../lib/schema.ts";
 import { bold, dim, failure, success, yellow } from "../lib/style.ts";
-import { createNotificationInbox, type NotificationInbox } from "../lib/test-notifications.ts";
+import {
+  createNotificationInbox,
+  type NotificationInbox,
+  type ReceivedNotification,
+} from "../lib/test-notifications.ts";
 import {
   checkResult,
   type FailureCause,
   judgeAnswer,
   judgeError,
+  keepsRunningOnceAccepted,
   MAX_OUTPUT_BYTES,
   type Outcome,
   PROVIDER_TIMEOUT_MS,
@@ -74,6 +86,12 @@ import { VERSION } from "../lib/version.ts";
 const MAX_SHOWN_BODY = 2_000;
 
 /**
+ * Varis fails an accepted call that sends no notification for this long, as
+ * provider_stopped_reporting (D3). The SDK sends one every 30 seconds.
+ */
+const SILENCE_LIMIT_MS = 300_000;
+
+/**
  * Everything the command reaches outside itself. The tests swap these to run
  * a whole test call against an in-process server, or on a spare port.
  */
@@ -82,8 +100,10 @@ export type TestDeps = {
   fetch: typeof fetch;
   createSigner: () => TestSigner;
   listen: (signer: TestSigner, inbox: NotificationInbox) => Promise<ListenResult>;
-  /** Milliseconds, for the timing in the success line. */
+  /** Milliseconds, for timings and the silence limit. */
   now: () => number;
+  /** Calls `callback` once a minute until the returned function is called. */
+  everyMinute: (callback: () => void) => () => void;
 };
 
 const defaultDeps = (): TestDeps => ({
@@ -92,6 +112,10 @@ const defaultDeps = (): TestDeps => ({
   createSigner: createTestSigner,
   listen: (signer, inbox) => openTestListener(signer, inbox),
   now: () => Date.now(),
+  everyMinute: (callback) => {
+    const timer = setInterval(callback, 60_000);
+    return () => clearInterval(timer);
+  },
 });
 
 /**
@@ -179,7 +203,7 @@ export async function runTest(
   // the key while handling the request. It closes in `finally`, whatever
   // happens, so the port is free for the next test and the process can exit.
   try {
-    return await runTestCall(call, signer, listening.listener, output, deps);
+    return await runTestCall(call, signer, listening.listener, inbox, output, deps);
   } finally {
     await listening.listener.close();
   }
@@ -326,11 +350,15 @@ function buildTestCall(
   return { slug, service, method, target, rawBody: "" };
 }
 
-/** Steps 6 and 7: sends the call, then judges the answer as the gateway would. */
+/**
+ * Steps 6 to 8: sends the call, judges the answer as the gateway would, and
+ * for a call the server accepted, waits for its result by notification.
+ */
 async function runTestCall(
   call: TestCall,
   signer: TestSigner,
   listener: TestListener,
+  inbox: NotificationInbox,
   output: Output,
   deps: TestDeps,
 ): Promise<number> {
@@ -338,14 +366,194 @@ async function runTestCall(
   output.err(dim(output, `Request ID ${signer.requestId}`));
   output.err(dim(output, `Invocation ID ${signer.invocationId}`));
 
-  const started = deps.now();
+  const startedAt = deps.now();
   const outcome = await sendTestCall(call, signer, deps.fetch);
-  const elapsed = deps.now() - started;
+  const elapsed = deps.now() - startedAt;
+
+  if (outcome.status === "started") {
+    inbox.markAccepted();
+    output.err(`Your server acknowledged the call with 202 started in ${elapsed} ms.`);
+    if (outcome.etaSeconds !== null || outcome.message !== null) {
+      output.err(`  ${describeProgress({ progressPercent: null, ...outcome })}`);
+    }
+    return await waitForResult(call, inbox, startedAt, output, deps);
+  }
+
+  // A started notification came before this answer, so the answer isn't
+  // the result (D26): the call goes on, unless the answer failed it.
+  if (inbox.accepted() && keepsRunningOnceAccepted(outcome)) {
+    output.err(
+      "Your server acknowledged the call with a started notification. Varis ignores its answer after that, so the call goes on.",
+    );
+    return await waitForResult(call, inbox, startedAt, output, deps);
+  }
 
   if (outcome.status === "failed") {
     return reportFailure(call, outcome.cause, listener.fetches(), output);
   }
   return reportSuccess(call, outcome.statusCode, outcome.payload, elapsed, output);
+}
+
+/**
+ * Step 8: prints each notification until one ends the call, then reports
+ * how it ended. There's no time limit: the developer stops it with Ctrl+C.
+ * As in production, an accepted call that goes 5 minutes without a
+ * notification fails; Varis checks once a minute, and so does the test.
+ */
+async function waitForResult(
+  call: TestCall,
+  inbox: NotificationInbox,
+  startedAt: number,
+  output: Output,
+  deps: TestDeps,
+): Promise<number> {
+  output.err("Waiting for its result by notification. Press Ctrl+C to stop.");
+  let lastHeardAt = deps.now();
+
+  let reportSilence!: () => void;
+  let silent = false;
+  const silenced = new Promise<number>((resolve) => {
+    reportSilence = () => resolve(reportStoppedReporting(output));
+  });
+  const stopReminders = deps.everyMinute(() => {
+    if (silent) return;
+    const now = deps.now();
+    if (now - lastHeardAt >= SILENCE_LIMIT_MS) {
+      silent = true;
+      reportSilence();
+    } else {
+      output.status(`Still waiting after ${formatDuration(now - startedAt)}. Press Ctrl+C to stop.`);
+    }
+  });
+
+  try {
+    for (;;) {
+      const notification = await Promise.race([inbox.next(), silenced]);
+      if (typeof notification === "number") return notification;
+
+      // Only a notification Varis records counts as hearing from the server.
+      if (notification.status === "started" || notification.status === "running") {
+        lastHeardAt = deps.now();
+      }
+      const code = reportNotification(call, notification, deps.now() - startedAt, output);
+      if (code !== undefined) return code;
+    }
+  } finally {
+    stopReminders();
+  }
+}
+
+/**
+ * Prints one notification. Returns the exit code when it ended the call, or
+ * undefined while the call goes on.
+ */
+function reportNotification(
+  call: TestCall,
+  notification: ReceivedNotification,
+  elapsed: number,
+  output: Output,
+): number | undefined {
+  const at = dim(output, formatDuration(elapsed).padStart(8));
+  switch (notification.status) {
+    case "started":
+      output.err(`${at}  Started.${withDetails({ progressPercent: null, ...notification })}`);
+      return undefined;
+    case "running":
+      output.err(`${at}  Running.${withDetails(notification)}`);
+      return undefined;
+    case "invalid":
+      output.err(
+        yellow(output, `${at}  Varis would refuse a notification from your server with 400, and the call would go on:`),
+      );
+      printProblems(notification.problems, output);
+      return undefined;
+    case "unauthorised":
+      output.err(
+        yellow(
+          output,
+          `${at}  Varis would refuse a notification from your server with 401. Send it with Authorization: Bearer and the X-Varis-Notification-Token header's value, for the invocation in X-Varis-Invocation-Id.`,
+        ),
+      );
+      return undefined;
+    case "completed":
+      if (notification.check.ok) {
+        return reportLongSuccess(call, notification.result, elapsed, output);
+      }
+      // A result is judged as a sync output is, so it fails the same way.
+      return reportFailure(call, notification.check.cause, 0, output);
+    case "failed":
+      return reportFailedNotification(notification, output);
+  }
+}
+
+/** A `failed` notification ended the call. */
+function reportFailedNotification(
+  notification: Extract<ReceivedNotification, { status: "failed" }>,
+  output: Output,
+): number {
+  if (notification.reason === "output_too_large") {
+    output.err(
+      failure(
+        output,
+        `Your server reported that its result is larger than ${formatMegabytes(MAX_OUTPUT_BYTES)} of JSON. Varis would fail this call as output_too_large and refund it.`,
+      ),
+    );
+    output.err("Return a large result as a URL to your own storage instead.");
+    return 1;
+  }
+  output.err(
+    failure(output, "Your server reported that the call failed. Varis would count this as a failed call and refund it."),
+  );
+  if (notification.message !== null) output.err(`Its message: ${notification.message}`);
+  return 1;
+}
+
+/** No notification for 5 minutes: Varis would have given up on the call. */
+function reportStoppedReporting(output: Output): number {
+  output.err(
+    failure(
+      output,
+      `Your server sent no notification for ${SILENCE_LIMIT_MS / 60_000} minutes. Varis would fail this call as provider_stopped_reporting and refund it.`,
+    ),
+  );
+  output.err(
+    "Send a running notification at least every 5 minutes while the work runs. @usevaris/sdk sends one every 30 seconds.",
+  );
+  return 1;
+}
+
+type Progress = {
+  progressPercent: number | null;
+  etaSeconds: number | null;
+  message: string | null;
+};
+
+/** "40%, about 10 min left. Rendering frame 400", or "" when there's nothing to say. */
+function describeProgress(progress: Progress): string {
+  const parts: string[] = [];
+  if (progress.progressPercent !== null) parts.push(`${progress.progressPercent}%`);
+  if (progress.etaSeconds !== null) {
+    parts.push(`about ${formatDuration(progress.etaSeconds * 1000)} left`);
+  }
+  const figures = parts.join(", ");
+  if (progress.message === null) return figures === "" ? "" : `${figures}.`;
+  return figures === "" ? progress.message : `${figures}. ${progress.message}`;
+}
+
+/** The progress after a space, ready to follow "Running.", or "". */
+function withDetails(progress: Progress): string {
+  const details = describeProgress(progress);
+  return details === "" ? "" : ` ${details}`;
+}
+
+/** A duration such as "45 s", "3 min 5 s", or "2 h 10 min". */
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return seconds % 60 === 0 ? `${minutes} min` : `${minutes} min ${seconds % 60} s`;
+  const hours = Math.floor(minutes / 60);
+  return minutes % 60 === 0 ? `${hours} h` : `${hours} h ${minutes % 60} min`;
 }
 
 /**
@@ -411,6 +619,23 @@ function reportSuccess(
   return 0;
 }
 
+/** A result came by notification and matched its schema: the call passed. */
+function reportLongSuccess(
+  call: TestCall,
+  result: unknown,
+  elapsed: number,
+  output: Output,
+): number {
+  output.err(
+    success(
+      output,
+      `${call.slug} passed: its result came by notification after ${formatDuration(elapsed)}, and it matches the output schema.`,
+    ),
+  );
+  output.out(JSON.stringify(result, null, 2));
+  return 0;
+}
+
 /** Says what would make a real call fail, and how to fix it. */
 function reportFailure(
   call: TestCall,
@@ -431,6 +656,18 @@ function reportFailure(
       return reportUnreachable(call.target, keyFetches, output);
     case "status":
       return reportStatus(cause.response, cause.text, keyFetches, output);
+    case "not_started":
+      output.err(
+        failure(
+          output,
+          `Your server answered 202, but not with {"status":"started"}. Varis would count this as a failed call and refund it.`,
+        ),
+      );
+      output.err(
+        `To finish later, answer 202 with exactly that body, then send the result by notification. @usevaris/sdk does both.`,
+      );
+      if (cause.text.trim() !== "") showBody(cause.text, output);
+      return 1;
     case "too_large":
       output.err(
         failure(
@@ -637,6 +874,11 @@ export const test: Command = {
 
   Set test_base_url once, for example:
     varis init --test-base-url http://localhost:3000
+
+  If your server accepts the call to finish later, by answering 202 with
+  {"status":"started"} or by sending a started notification first, varis
+  test waits for the result by notification, as Varis would. It prints
+  each notification, then checks the result. Press Ctrl+C to stop waiting.
 
   It reads varis.json as it is. After changing a service, run varis build
   first.

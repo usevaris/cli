@@ -11,6 +11,12 @@ import { type SchemaProblem, validate } from "./schema.ts";
 /** The gateway gives a provider this long to answer, body included. */
 export const PROVIDER_TIMEOUT_MS = 30_000;
 
+/** An ETA past this is dropped: every call ends within 24 hours. */
+const MAX_ETA_SECONDS = 86_400;
+
+/** A provider's message to agents is cut to this many characters (D8). */
+const MAX_MESSAGE_CHARS = 160;
+
 /**
  * The largest output Varis delivers, as JSON text. Vercel caps a function's
  * response body at 4.5 MB, so the gateway fails a larger output as
@@ -33,6 +39,8 @@ export type FailureCause =
   | { kind: "unreachable"; error: unknown }
   /** A redirect or an error status. */
   | { kind: "status"; response: Response; text: string }
+  /** A 202 without the body `{"status":"started"}`. */
+  | { kind: "not_started"; text: string }
   /** An output over MAX_OUTPUT_BYTES, which Varis can't deliver. */
   | { kind: "too_large"; bytes: number }
   | { kind: "not_json"; statusCode: number; text: string }
@@ -42,6 +50,8 @@ export type FailureCause =
 
 export type Outcome =
   | { status: "success"; statusCode: number; payload: unknown }
+  /** The provider accepted the call and will report on it by notification. */
+  | { status: "started"; etaSeconds: number | null; message: string | null }
   | { status: "failed"; reason: FailureReason; cause: FailureCause };
 
 /** Judges an answer that arrived, body and all. */
@@ -50,6 +60,13 @@ export function judgeAnswer(
   text: string,
   outputSchema: unknown,
 ): Outcome {
+  // A 202 is a promise to finish later, and only in Varis's own shape.
+  // Anything else in a 202 is a provider bug, not an output.
+  if (response.status === 202) {
+    return readStarted(text) ??
+      failed("provider_error", { kind: "not_started", text });
+  }
+
   if (!response.ok) {
     // 408 and 504 are the provider saying it ran out of time.
     const reason = response.status === 408 || response.status === 504
@@ -85,6 +102,19 @@ export function judgeError(error: unknown): Outcome {
     : failed("provider_error", { kind: "unreachable", error });
 }
 
+/**
+ * Whether the call goes on when this answer arrives after a `started`
+ * notification already accepted it (D26). Only an answer the provider might
+ * send after accepting can lose to its own `started`: a success, a 2xx with
+ * the wrong shape, or no answer in time. Anything else fails the call.
+ * mayLoseToAcceptance in the varis repository.
+ */
+export function keepsRunningOnceAccepted(outcome: Outcome): boolean {
+  return outcome.status === "success" ||
+    (outcome.status === "failed" &&
+      (outcome.reason === "schema_violation" || outcome.reason === "timeout"));
+}
+
 export type OutputCheck =
   | { ok: true }
   | { ok: false; reason: FailureReason; cause: FailureCause };
@@ -117,6 +147,34 @@ export function checkResult(result: unknown, outputSchema: unknown): OutputCheck
     return { ok: false, reason: "output_too_large", cause: { kind: "too_large", bytes } };
   }
   return checkOutput(result, outputSchema);
+}
+
+/**
+ * The `started` outcome from a 202 body of `{"status": "started"}`, or null.
+ * An invalid eta_seconds or message is dropped rather than failing the call:
+ * the provider did accept it.
+ */
+function readStarted(text: string): Extract<Outcome, { status: "started" }> | null {
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof body !== "object" || body === null) return null;
+  const { status, eta_seconds: eta, message } = body as Record<string, unknown>;
+  if (status !== "started") return null;
+
+  return {
+    status: "started",
+    etaSeconds: typeof eta === "number" && Number.isInteger(eta) && eta >= 0 &&
+        eta <= MAX_ETA_SECONDS
+      ? eta
+      : null,
+    message: typeof message === "string" && message.length > 0
+      ? message.slice(0, MAX_MESSAGE_CHARS)
+      : null,
+  };
 }
 
 function failed(reason: FailureReason, cause: FailureCause): Outcome {

@@ -69,11 +69,13 @@ async function freePort(): Promise<number> {
 
 type Seen = { method: string; url: string; headers: IncomingMessage["headers"]; body: string };
 
+type Answer = { status: number; body: unknown; headers?: Record<string, string> };
+
 /**
  * What the provider's handler does with a verified request. Returns the
  * status and JSON body to answer with.
  */
-type Handler = (seen: Seen) => { status: number; body: unknown; headers?: Record<string, string> };
+type Handler = (seen: Seen) => Answer | Promise<Answer>;
 
 /**
  * How the provider's SDK checks a signature: `current` is SDK 1.2.0 and
@@ -88,9 +90,14 @@ type Verifier = "current" | "old" | false;
  * key is fetched from the listener for that request ID, and the signature
  * must cover the timestamp, invocation ID, method, path and query, and body.
  * A request that fails gets a 401, as a handler calling verifyRequest would
- * send.
+ * send. `after` runs once the handler's answer is sent, as the SDK's work
+ * goes on after a 202.
  */
-function provider(keyPort: number, handler: Handler, verifies: Verifier = "current") {
+function provider(
+  keyPort: number,
+  handler: Handler,
+  { verifies = "current", after }: { verifies?: Verifier; after?: (seen: Seen) => Promise<void> } = {},
+) {
   const seen: Seen[] = [];
   const server: Server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -109,9 +116,10 @@ function provider(keyPort: number, handler: Handler, verifies: Verifier = "curre
       return;
     }
 
-    const answer = handler(current);
+    const answer = await handler(current);
     response.writeHead(answer.status, { "Content-Type": "application/json", ...answer.headers });
     response.end(typeof answer.body === "string" ? answer.body : JSON.stringify(answer.body));
+    if (after) void after(current);
   });
   return { server, seen };
 }
@@ -189,10 +197,11 @@ async function manifest(testBaseUrl: string | undefined, services: object[] = [W
 async function run(args: string[], overrides: Partial<TestDeps> = {}) {
   const out: string[] = [];
   const err: string[] = [];
+  const status: string[] = [];
   const output: Output = {
     out: (t) => out.push(t),
     err: (t) => err.push(t),
-    status: () => {},
+    status: (t) => status.push(t),
     styled: false,
   };
   const deps: TestDeps = {
@@ -201,10 +210,58 @@ async function run(args: string[], overrides: Partial<TestDeps> = {}) {
     createSigner: createTestSigner,
     listen: (signer, inbox) => openTestListener(signer, inbox, keyPort),
     now: () => 0,
+    // Never fires unless a test asks it to.
+    everyMinute: () => () => {},
     ...overrides,
   };
   const code = await runTest(args, output, deps);
-  return { code, out: out.join("\n"), err: err.join("\n") };
+  return { code, out: out.join("\n"), err: err.join("\n"), status };
+}
+
+/**
+ * Sends a notification for the call `seen` received, as the SDK does: to the
+ * listener, with the call's own token. Returns the listener's answer.
+ */
+async function notify(seen: Seen, body: unknown): Promise<{ status: number; body: unknown }> {
+  const invocationId = String(seen.headers["x-varis-invocation-id"]);
+  const answer = await fetch(
+    `http://127.0.0.1:${keyPort}${LISTENER_NOTIFICATIONS_PATH}?invocation_id=${encodeURIComponent(invocationId)}`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${String(seen.headers["x-varis-notification-token"])}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    },
+  );
+  return { status: answer.status, body: await answer.json() };
+}
+
+/** A clock the test moves by hand, and an everyMinute that ticks it. */
+function manualClock() {
+  let now = 0;
+  let tick: (() => void) | undefined;
+  return {
+    now: () => now,
+    everyMinute: (callback: () => void) => {
+      tick = callback;
+      return () => {
+        tick = undefined;
+      };
+    },
+    /** Moves the clock on and fires the minute timer, if it's running. */
+    advance: (ms: number) => {
+      now += ms;
+      tick?.();
+    },
+    ticking: () => tick !== undefined,
+  };
+}
+
+/** Resolves once `condition` holds, checking every few milliseconds. */
+async function until(condition: () => boolean): Promise<void> {
+  while (!condition()) await new Promise((done) => setTimeout(done, 5));
 }
 
 describe("varis test", () => {
@@ -331,7 +388,9 @@ describe("varis test", () => {
   it("explains a 401 when the server never fetched the key", async () => {
     // A server that rejects without asking: no verifyRequest, an old SDK,
     // or no way to reach this machine's loopback.
-    const p = provider(keyPort, () => ({ status: 401, body: { error: "unauthorised" } }), false);
+    const p = provider(keyPort, () => ({ status: 401, body: { error: "unauthorised" } }), {
+      verifies: false,
+    });
     await manifest(await start(p));
 
     const result = await run(["weather", "--input", '{"city":"Lagos"}']);
@@ -359,7 +418,9 @@ describe("varis test", () => {
   });
 
   it("fails a server on an SDK that signs without the invocation ID, and says to upgrade", async () => {
-    const p = provider(keyPort, () => ({ status: 200, body: { temp_c: 1 } }), "old");
+    const p = provider(keyPort, () => ({ status: 200, body: { temp_c: 1 } }), {
+      verifies: "old",
+    });
     await manifest(await start(p));
 
     const result = await run(["weather", "--input", '{"city":"Lagos"}']);
@@ -491,6 +552,273 @@ describe("varis test", () => {
     expect((await run([])).code).toBe(2);
     expect((await run(["a", "b"])).code).toBe(2);
     expect((await run(["a", "--input", "{}", "--input-file", "x"])).code).toBe(2);
+  });
+});
+
+describe("varis test, for a call that finishes later", () => {
+  const STARTED = { status: 202, body: { status: "started" } };
+
+  it("waits after 202 started, prints progress, and passes a valid result", async () => {
+    const answers: unknown[] = [];
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        answers.push(
+          await notify(seen, { status: "running", progress_percent: 40, eta_seconds: 60, message: "Rendering" }),
+        );
+        answers.push(await notify(seen, { status: "completed", result: { temp_c: 18 } }));
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toEqual({ temp_c: 18 });
+    expect(result.err).toContain("acknowledged the call with 202 started");
+    expect(result.err).toContain("Running. 40%, about 1 min left. Rendering");
+    expect(result.err).toContain("weather passed: its result came by notification");
+    // The listener closes gracefully, so the answer that ended the call
+    // still reaches the server.
+    await until(() => answers.length === 2);
+    expect(answers).toEqual([
+      { status: 200, body: { continue: true } },
+      { status: 200, body: { continue: false } },
+    ]);
+  });
+
+  it("prints the ETA and message from a 202 started", async () => {
+    const p = provider(keyPort, () => ({
+      status: 202,
+      body: { status: "started", eta_seconds: 600, message: "Queued for rendering" },
+    }), {
+      after: async (seen) => {
+        await notify(seen, { status: "completed", result: { temp_c: 1 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(result.err).toContain("about 10 min left. Queued for rendering");
+  });
+
+  it("treats a started notification before the answer as accepting the call, and ignores the answer (D26)", async () => {
+    let started: unknown;
+    const p = provider(keyPort, async (seen) => {
+      started = await notify(seen, { status: "started" });
+      // What a route that hands work to a queue answers its own users.
+      return { status: 200, body: { queued: true } };
+    }, {
+      after: async (seen) => {
+        await notify(seen, { status: "completed", result: { temp_c: 9 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(started).toEqual({ status: 200, body: { continue: true } });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toEqual({ temp_c: 9 });
+    expect(result.out).not.toContain("queued");
+    expect(result.err).toContain("acknowledged the call with a started notification");
+  });
+
+  it("keeps a call running when a 504 follows a started notification, as the gateway does", async () => {
+    const p = provider(keyPort, async (seen) => {
+      await notify(seen, { status: "started" });
+      return { status: 504, body: {} };
+    }, {
+      after: async (seen) => {
+        await notify(seen, { status: "completed", result: { temp_c: 2 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+  });
+
+  it("fails a call whose answer is an error after a started notification, as the gateway refunds it", async () => {
+    const p = provider(keyPort, async (seen) => {
+      await notify(seen, { status: "started" });
+      return { status: 500, body: { error: "queue down" } };
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("answered 500");
+    expect(result.err).toContain("queue down");
+  });
+
+  it("ignores progress notifications on a call that answered without accepting", async () => {
+    const p = provider(keyPort, async (seen) => {
+      await notify(seen, { status: "running" });
+      return { status: 200, body: { temp_c: 4 } };
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toEqual({ temp_c: 4 });
+    expect(result.err).toContain("weather passed: 200");
+  });
+
+  it("fails a 202 without {\"status\":\"started\"}, as a provider_error", async () => {
+    const p = provider(keyPort, () => ({ status: 202, body: { accepted: true } }));
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain(`answered 202, but not with {"status":"started"}`);
+    expect(result.err).toContain('{"accepted":true}');
+  });
+
+  it("fails a result that breaks the output schema, and the server gets a 422", async () => {
+    let answer: unknown;
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        answer = await notify(seen, { status: "completed", result: { temp_c: "cold" } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.out).toBe("");
+    expect(result.err).toContain("doesn't match weather's output schema");
+    expect(result.err).toContain("/temp_c  must be number");
+    await until(() => answer !== undefined);
+    expect(answer).toMatchObject({ status: 422, body: { continue: false } });
+  });
+
+  it("fails a result over 4 MB as output_too_large, and the server gets a 413", async () => {
+    let answer: unknown;
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        answer = await notify(seen, {
+          status: "completed",
+          result: { temp_c: 1, padding: "x".repeat(4 * 1024 * 1024) },
+        });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("output_too_large");
+    await until(() => answer !== undefined);
+    expect(answer).toMatchObject({ status: 413, body: { continue: false } });
+  });
+
+  it("fails when the server reports the call failed, and shows its message", async () => {
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        await notify(seen, { status: "failed", message: "Out of GPU memory" });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("reported that the call failed");
+    expect(result.err).toContain("Its message: Out of GPU memory");
+  });
+
+  it("fails when the SDK reports its result too large to send", async () => {
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        await notify(seen, { status: "failed", reason: "output_too_large" });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("larger than 4 MB of JSON");
+    expect(result.err).toContain("output_too_large");
+  });
+
+  it("explains a notification Varis would refuse, and keeps waiting", async () => {
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        await notify(seen, { status: "running", progress_percent: 140 });
+        await notify({ ...seen, headers: { ...seen.headers, "x-varis-notification-token": "var_nt_wrong" } }, {
+          status: "running",
+        });
+        await notify(seen, { status: "completed", result: { temp_c: 3 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(result.err).toContain("refuse a notification from your server with 400");
+    expect(result.err).toContain("/progress_percent  must be a whole number from 0 to 100");
+    expect(result.err).toContain("refuse a notification from your server with 401");
+  });
+
+  it("reminds the developer every minute that it's still waiting", async () => {
+    const clock = manualClock();
+    let finish!: () => Promise<unknown>;
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        finish = () => notify(seen, { status: "completed", result: { temp_c: 5 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const running = run(["weather", "--input", '{"city":"Lagos"}'], clock);
+    await until(() => clock.ticking() && finish !== undefined);
+    clock.advance(60_000);
+    clock.advance(60_000);
+    await finish();
+    const result = await running;
+
+    expect(result.code).toBe(0);
+    expect(result.status).toEqual([
+      "Still waiting after 1 min. Press Ctrl+C to stop.",
+      "Still waiting after 2 min. Press Ctrl+C to stop.",
+    ]);
+    expect(clock.ticking()).toBe(false);
+  });
+
+  it("fails a call that sends no notification for 5 minutes, as provider_stopped_reporting", async () => {
+    const clock = manualClock();
+    let heartbeat!: () => Promise<unknown>;
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        heartbeat = () => notify(seen, { status: "running" });
+      },
+    });
+    await manifest(await start(p));
+
+    const running = run(["weather", "--input", '{"city":"Lagos"}'], clock);
+    await until(() => clock.ticking() && heartbeat !== undefined);
+    // A heartbeat at 4 minutes restarts the 5 minutes.
+    clock.advance(240_000);
+    await heartbeat();
+    // Lets the command read the heartbeat before the clock moves again.
+    await new Promise((done) => setTimeout(done, 10));
+    clock.advance(240_000);
+    expect(clock.ticking()).toBe(true);
+    clock.advance(60_000);
+    const result = await running;
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("no notification for 5 minutes");
+    expect(result.err).toContain("provider_stopped_reporting");
   });
 });
 

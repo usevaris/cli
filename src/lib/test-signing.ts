@@ -192,6 +192,9 @@ export type TestListener = {
   close: () => Promise<void>;
 };
 
+/** How long close waits for answers still being written. */
+const CLOSE_GRACE_MS = 1_000;
+
 export type ListenResult =
   | { ok: true; listener: TestListener }
   /** The port is taken, most likely by another varis test still running. */
@@ -253,10 +256,16 @@ export function openTestListener(
           fetches: () => fetches,
           close: () =>
             new Promise<void>((done) => {
-              // Drop idle keep-alive connections too, so close resolves now
-              // rather than when the server's connection times out.
-              server.closeAllConnections?.();
-              server.close(() => done());
+              // An answer still being written, such as the one to the
+              // notification that ended the call, gets a moment to reach the
+              // SDK, or it would retry. Idle keep-alive connections close
+              // now, and anything still open after the grace period is cut.
+              const force = setTimeout(() => server.closeAllConnections(), CLOSE_GRACE_MS);
+              server.close(() => {
+                clearTimeout(force);
+                done();
+              });
+              server.closeIdleConnections();
             }),
         },
       });
