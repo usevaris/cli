@@ -12,6 +12,8 @@
 //   4. checks a `completed` result, then answers 200, 413, or 422 with
 //      `continue: false`, and records how the call ended;
 //   5. records `failed` and answers `continue: false`.
+// Before recording a notification, it records any notice about parts Varis
+// would quietly drop: a field it doesn't read, or a message it cuts.
 // src/commands/test.ts reads what's recorded, in order, through `next`.
 
 import type { SchemaProblem } from "./schema.ts";
@@ -43,6 +45,11 @@ export type ReceivedNotification =
   /** `check` is how Varis judged the result. */
   | { status: "completed"; result: unknown; check: OutputCheck }
   | Extract<NotificationBody, { status: "failed" }>
+  /**
+   * Parts of the next notification Varis would accept but drop, so the
+   * developer can fix them. Recorded just before that notification.
+   */
+  | { status: "notice"; notices: SchemaProblem[] }
   /** A body Varis would refuse with a 400, and why. */
   | { status: "invalid"; problems: SchemaProblem[] }
   /** A notification without the token sent with the call, refused with a 401. */
@@ -120,6 +127,7 @@ export function createNotificationInbox(
       }
       if (ending) return endedAnswer(ending);
 
+      if (parsed.notices.length > 0) record({ status: "notice", notices: parsed.notices });
       const body = parsed.body;
       switch (body.status) {
         case "started":
@@ -170,15 +178,36 @@ function readJson(rawBody: string): unknown {
   }
 }
 
+/** The fields each notification reads. The route ignores any others. */
+const FIELDS: Record<NotificationBody["status"], readonly string[]> = {
+  started: ["status", "eta_seconds", "message"],
+  running: ["status", "progress_percent", "eta_seconds", "message"],
+  completed: ["status", "result"],
+  failed: ["status", "message", "reason"],
+};
+
+/** Names a developer might write for a field, beyond its spelling and case. */
+const LIKELY_MEANT: Record<string, string> = {
+  progress: "progress_percent",
+  percent: "progress_percent",
+  percentage: "progress_percent",
+  eta: "eta_seconds",
+  msg: "message",
+  output: "result",
+  data: "result",
+};
+
 /**
  * The body as one of the four notifications, or its problems. The same
  * rules as the route's zod schema: unknown fields are ignored, an optional
  * field may be left out but not null, and `message` is cut to 160
- * characters.
+ * characters. What's ignored or cut comes back as notices.
  */
 export function parseNotificationBody(
   raw: unknown,
-): { ok: true; body: NotificationBody } | { ok: false; problems: SchemaProblem[] } {
+):
+  | { ok: true; body: NotificationBody; notices: SchemaProblem[] }
+  | { ok: false; problems: SchemaProblem[] } {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return { ok: false, problems: [{ path: "/", message: "must be a JSON object" }] };
   }
@@ -223,7 +252,51 @@ export function parseNotificationBody(
         problems: [{ path: "/status", message: "must be started, running, completed, or failed" }],
       };
   }
-  return problems.length > 0 ? { ok: false, problems } : { ok: true, body };
+  if (problems.length > 0) return { ok: false, problems };
+  return { ok: true, body, notices: findNotices(fields, body.status) };
+}
+
+/** The fields Varis would ignore in a notification, and a message it would cut. */
+function findNotices(
+  fields: Record<string, unknown>,
+  status: NotificationBody["status"],
+): SchemaProblem[] {
+  const notices: SchemaProblem[] = [];
+  for (const name of Object.keys(fields)) {
+    if (FIELDS[status].includes(name)) continue;
+    notices.push({ path: `/${name}`, message: describeIgnoredField(name, status) });
+  }
+  const message = fields.message;
+  if (FIELDS[status].includes("message") && typeof message === "string" && message.length > MAX_MESSAGE_CHARS) {
+    notices.push({
+      path: "/message",
+      message: `is ${message.length} characters. Varis keeps the first ${MAX_MESSAGE_CHARS}, so agents see it cut.`,
+    });
+  }
+  return notices;
+}
+
+/** "a", "a and b", or "a, b, and c". */
+function listInWords(items: string[]): string {
+  if (items.length <= 2) return items.join(" and ");
+  return `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}`;
+}
+
+/** Why Varis ignores `name`, and what the developer probably meant. */
+function describeIgnoredField(name: string, status: NotificationBody["status"]): string {
+  const known = Object.values(FIELDS).flat();
+  if (known.includes(name)) {
+    const readers = Object.entries(FIELDS)
+      .filter(([, names]) => names.includes(name))
+      .map(([reader]) => reader);
+    return `is ignored on ${status} notifications. Varis reads it only on ${listInWords(readers)}.`;
+  }
+  const normalised = name.toLowerCase().replace(/[^a-z]/g, "");
+  const meant = LIKELY_MEANT[normalised] ??
+    known.find((field) => field.replace(/_/g, "") === normalised);
+  return meant
+    ? `isn't a field Varis reads, so it's ignored. Did you mean ${meant}?`
+    : "isn't a field Varis reads, so it's ignored.";
 }
 
 /** `message`, cut to 160 characters, or null when absent or empty. */

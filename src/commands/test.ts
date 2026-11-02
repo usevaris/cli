@@ -461,6 +461,10 @@ function reportNotification(
     case "running":
       output.err(`${at}  Running.${withDetails(notification)}`);
       return undefined;
+    case "notice":
+      output.err(yellow(output, `${at}  Varis would drop part of a notification from your server:`));
+      printProblems(notification.notices, output);
+      return undefined;
     case "invalid":
       output.err(
         yellow(output, `${at}  Varis would refuse a notification from your server with 400, and the call would go on:`),

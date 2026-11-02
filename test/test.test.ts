@@ -769,6 +769,24 @@ describe("varis test, for a call that finishes later", () => {
     expect(result.err).toContain("refuse a notification from your server with 401");
   });
 
+  it("warns about parts of a notification Varis would drop, and keeps the notification", async () => {
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        await notify(seen, { status: "running", etaSeconds: 60, message: "y".repeat(200) });
+        await notify(seen, { status: "completed", result: { temp_c: 3 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(result.err).toContain("Varis would drop part of a notification from your server:");
+    expect(result.err).toContain("/etaSeconds  isn't a field Varis reads, so it's ignored. Did you mean eta_seconds?");
+    expect(result.err).toContain("/message  is 200 characters. Varis keeps the first 160");
+    expect(result.err).toContain(`Running. ${"y".repeat(160)}`);
+  });
+
   it("reminds the developer every minute that it's still waiting", async () => {
     const clock = manualClock();
     let finish!: () => Promise<unknown>;

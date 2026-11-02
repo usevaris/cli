@@ -179,6 +179,27 @@ describe("the notification inbox", () => {
     expect(await box.next()).toEqual({ status: "unauthorised" });
   });
 
+  it("records a notice before a notification with parts Varis would drop", async () => {
+    const box = inbox();
+
+    const answer = send(box, { status: "running", etaSeconds: 60, progress_percent: 10 });
+
+    expect(answer).toEqual({ status: 200, body: { continue: true } });
+    expect(await box.next()).toEqual({
+      status: "notice",
+      notices: [{ path: "/etaSeconds", message: "isn't a field Varis reads, so it's ignored. Did you mean eta_seconds?" }],
+    });
+    expect(await box.next()).toMatchObject({ status: "running", progressPercent: 10, etaSeconds: null });
+  });
+
+  it("records no notice for a notification Varis reads in full", async () => {
+    const box = inbox();
+
+    send(box, { status: "running", progress_percent: 10, eta_seconds: 5, message: "ok" });
+
+    expect((await box.next()).status).toBe("running");
+  });
+
   it("hands out notifications in order, waiting for one that hasn't arrived", async () => {
     const box = inbox();
     const first = box.next();
@@ -225,6 +246,35 @@ describe("parseNotificationBody", () => {
     expect(problemsOf({ status: "started", eta_seconds: -1 })).toEqual(["/eta_seconds"]);
     expect(problemsOf({ status: "started", message: null })).toEqual(["/message"]);
     expect(problemsOf({ status: "failed", reason: "oops" })).toEqual(["/reason"]);
+  });
+
+  const noticesOf = (raw: unknown) => {
+    const parsed = parseNotificationBody(raw);
+    return parsed.ok ? parsed.notices : [];
+  };
+
+  it("notes a field Varis doesn't read, suggesting the one it probably means", () => {
+    expect(noticesOf({ status: "running", progressPercent: 4, ETA: 9, colour: "red" })).toEqual([
+      { path: "/progressPercent", message: "isn't a field Varis reads, so it's ignored. Did you mean progress_percent?" },
+      { path: "/ETA", message: "isn't a field Varis reads, so it's ignored. Did you mean eta_seconds?" },
+      { path: "/colour", message: "isn't a field Varis reads, so it's ignored." },
+    ]);
+  });
+
+  it("notes a field that another status reads", () => {
+    expect(noticesOf({ status: "started", progress_percent: 5 })).toEqual([
+      { path: "/progress_percent", message: "is ignored on started notifications. Varis reads it only on running." },
+    ]);
+    expect(noticesOf({ status: "completed", result: 1, message: "done" })).toEqual([
+      { path: "/message", message: "is ignored on completed notifications. Varis reads it only on started, running, and failed." },
+    ]);
+  });
+
+  it("notes a message Varis cuts to 160 characters", () => {
+    expect(noticesOf({ status: "failed", message: "x".repeat(170) })).toEqual([
+      { path: "/message", message: "is 170 characters. Varis keeps the first 160, so agents see it cut." },
+    ]);
+    expect(noticesOf({ status: "failed", message: "x".repeat(160) })).toEqual([]);
   });
 
   it("ignores fields a status doesn't have, as the route does", () => {
