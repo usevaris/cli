@@ -12,6 +12,9 @@ import path from "node:path";
 import { REPOSITORY_URL } from "./constants.ts";
 import type { Runner } from "./generator.ts";
 
+/** A renamed repository redirects; more hops than this is a loop. */
+const MAX_RENAME_REDIRECTS = 3;
+
 /**
  * The latest full release's version, such as "0.2.1", or null when there's
  * no full release yet.
@@ -20,16 +23,33 @@ import type { Runner } from "./generator.ts";
  * not from the GitHub API: the API allows 60 unauthenticated requests an
  * hour per IP address, which a shared office or CI network can use up.
  * /releases/latest never points at a pre-release.
+ *
+ * When the repository has been renamed, GitHub first redirects to the new
+ * name's /releases/latest. That redirect is followed, so a released copy
+ * keeps finding new versions after a rename.
  */
-export async function latestVersion(fetchFn: typeof fetch): Promise<string | null> {
-  const response = await fetchFn(`${REPOSITORY_URL}/releases/latest`, {
-    redirect: "manual",
-    signal: AbortSignal.timeout(15_000),
-  });
-  const location = response.headers.get("location");
-  if (response.status < 300 || response.status >= 400 || !location) return null;
-  const match = /\/releases\/tag\/v([^/?#]+)$/.exec(location);
-  return match ? match[1]! : null;
+export async function latestVersion(
+  fetchFn: typeof fetch,
+  timeoutMs = 15_000,
+): Promise<string | null> {
+  const signal = AbortSignal.timeout(timeoutMs);
+  let url = `${REPOSITORY_URL}/releases/latest`;
+  for (let hop = 0; hop <= MAX_RENAME_REDIRECTS; hop++) {
+    const response = await fetchFn(url, { redirect: "manual", signal });
+    const location = response.headers.get("location");
+    if (response.status < 300 || response.status >= 400 || !location) return null;
+
+    const target = new URL(location, url);
+    const tag = /\/releases\/tag\/v([^/?#]+)$/.exec(target.pathname);
+    if (tag) return decodeURIComponent(tag[1]!);
+    // Only a renamed repository's own /releases/latest is followed, and
+    // only on GitHub.
+    if (target.hostname !== "github.com" || !target.pathname.endsWith("/releases/latest")) {
+      return null;
+    }
+    url = target.href;
+  }
+  return null;
 }
 
 /**

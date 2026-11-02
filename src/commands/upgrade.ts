@@ -28,6 +28,7 @@ import { chmod, mkdtemp, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Command } from "../lib/command.ts";
+import { REPOSITORY_URL } from "../lib/constants.ts";
 import { runCommand, runCommandShown, type Runner } from "../lib/generator.ts";
 import { type Channel, detectChannel } from "../lib/install-channel.ts";
 import { reportLines } from "../lib/issues.ts";
@@ -97,7 +98,7 @@ export async function runUpgrade(
     output.err(failure(output, `varis upgrade can't tell how ${channel.binary} was installed.`));
     output.err("It upgrades copies from Homebrew, Scoop, or the install script. Reinstall with one of them:");
     output.err("");
-    output.err("  https://github.com/usevaris/varis-cli#install");
+    output.err(`  ${REPOSITORY_URL}#install`);
     return 1;
   }
 
