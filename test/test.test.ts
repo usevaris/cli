@@ -13,13 +13,17 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runTest, type TestDeps } from "../src/commands/test.ts";
 import type { Output } from "../src/lib/output.ts";
+import { createNotificationInbox, type NotificationInbox } from "../src/lib/test-notifications.ts";
 import {
   createTestSigner,
+  LISTENER_NOTIFICATIONS_PATH,
   LISTENER_PATH,
   openTestListener,
   signedString,
   TEST_KEY_ID,
   TEST_REQUEST_ID_PREFIX,
+  type TestListener,
+  type TestSigner,
 } from "../src/lib/test-signing.ts";
 
 const WEATHER = {
@@ -195,7 +199,7 @@ async function run(args: string[], overrides: Partial<TestDeps> = {}) {
     cwd: project,
     fetch,
     createSigner: createTestSigner,
-    listen: (signer) => openTestListener(signer, keyPort),
+    listen: (signer, inbox) => openTestListener(signer, inbox, keyPort),
     now: () => 0,
     ...overrides,
   };
@@ -526,12 +530,41 @@ describe("the test signer", () => {
   });
 });
 
-describe("the key listener", () => {
-  it("serves the key only for the request it signed", async () => {
+describe("the test listener", () => {
+  const anyResult = () => ({ ok: true as const });
+
+  /** Opens a listener for a fresh signer, runs `body`, and always closes it. */
+  async function withListener(
+    body: (signer: TestSigner, inbox: NotificationInbox, listener: TestListener) => Promise<void>,
+  ) {
     const signer = createTestSigner();
-    const listening = await openTestListener(signer, keyPort);
+    const inbox = createNotificationInbox(anyResult);
+    const listening = await openTestListener(signer, inbox, keyPort);
     if (!listening.ok) throw new Error(listening.message);
     try {
+      await body(signer, inbox, listening.listener);
+    } finally {
+      await listening.listener.close();
+    }
+  }
+
+  /** Sends a notification the way the SDK does. */
+  function notify(invocationId: string, token: string | undefined, body: unknown) {
+    return fetch(
+      `http://127.0.0.1:${keyPort}${LISTENER_NOTIFICATIONS_PATH}?invocation_id=${encodeURIComponent(invocationId)}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(token !== undefined && { authorization: `Bearer ${token}` }),
+        },
+        body: JSON.stringify(body),
+      },
+    );
+  }
+
+  it("serves the key only for the request it signed", async () => {
+    await withListener(async (signer, _inbox, listener) => {
       const base = `http://127.0.0.1:${keyPort}${LISTENER_PATH}`;
       const right = await fetch(`${base}?request_id=${signer.requestId}`);
       const wrong = await fetch(`${base}?request_id=${TEST_REQUEST_ID_PREFIX}other`);
@@ -541,9 +574,54 @@ describe("the key listener", () => {
       expect(await right.json()).toEqual({ kid: TEST_KEY_ID, public_key_pem: signer.publicKeyPem });
       expect(wrong.status).toBe(404);
       expect(elsewhere.status).toBe(404);
-      expect(listening.listener.fetches()).toBe(1);
-    } finally {
-      await listening.listener.close();
-    }
+      expect(listener.fetches()).toBe(1);
+    });
+  });
+
+  it("takes a notification with the token it issued, for its invocation", async () => {
+    await withListener(async (signer, inbox) => {
+      const answer = await notify(signer.invocationId, signer.notificationToken, {
+        status: "running",
+        message: "Rendering",
+      });
+
+      expect(answer.status).toBe(200);
+      expect(await answer.json()).toEqual({ continue: true });
+      expect(await inbox.next()).toEqual({
+        status: "running",
+        progressPercent: null,
+        etaSeconds: null,
+        message: "Rendering",
+      });
+    });
+  });
+
+  it("refuses a notification with a wrong or missing token, or for another invocation, with a 401", async () => {
+    await withListener(async (signer, inbox) => {
+      const answers = [
+        await notify(signer.invocationId, "var_nt_test_wrong", { status: "running" }),
+        await notify(signer.invocationId, undefined, { status: "running" }),
+        await notify("var_tst_invk_other", signer.notificationToken, { status: "running" }),
+      ];
+
+      for (const answer of answers) {
+        expect(answer.status).toBe(401);
+        expect(await answer.json()).toMatchObject({
+          continue: false,
+          error: { code: "unauthorized" },
+        });
+      }
+      expect(await inbox.next()).toEqual({ status: "unauthorised" });
+      expect(inbox.accepted()).toBe(false);
+    });
+  });
+
+  it("refuses a GET to the notifications path", async () => {
+    await withListener(async (signer) => {
+      const answer = await fetch(
+        `http://127.0.0.1:${keyPort}${LISTENER_NOTIFICATIONS_PATH}?invocation_id=${signer.invocationId}`,
+      );
+      expect(answer.status).toBe(404);
+    });
   });
 });

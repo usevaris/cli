@@ -107,6 +107,18 @@ export function checkOutput(payload: unknown, outputSchema: unknown): OutputChec
   };
 }
 
+/**
+ * Checks a result sent in a `completed` notification, as the notification
+ * route does: at most 4 MB of JSON, then the output schema.
+ */
+export function checkResult(result: unknown, outputSchema: unknown): OutputCheck {
+  const bytes = Buffer.byteLength(JSON.stringify(result), "utf8");
+  if (bytes > MAX_OUTPUT_BYTES) {
+    return { ok: false, reason: "output_too_large", cause: { kind: "too_large", bytes } };
+  }
+  return checkOutput(result, outputSchema);
+}
+
 function failed(reason: FailureReason, cause: FailureCause): Outcome {
   return { status: "failed", reason, cause };
 }

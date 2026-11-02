@@ -49,7 +49,9 @@ import type { Output } from "../lib/output.ts";
 import { toQueryString } from "../lib/query-string.ts";
 import { type SchemaProblem, validate } from "../lib/schema.ts";
 import { bold, dim, failure, success, yellow } from "../lib/style.ts";
+import { createNotificationInbox, type NotificationInbox } from "../lib/test-notifications.ts";
 import {
+  checkResult,
   type FailureCause,
   judgeAnswer,
   judgeError,
@@ -79,7 +81,7 @@ export type TestDeps = {
   cwd: string;
   fetch: typeof fetch;
   createSigner: () => TestSigner;
-  listen: (signer: TestSigner) => Promise<ListenResult>;
+  listen: (signer: TestSigner, inbox: NotificationInbox) => Promise<ListenResult>;
   /** Milliseconds, for the timing in the success line. */
   now: () => number;
 };
@@ -88,7 +90,7 @@ const defaultDeps = (): TestDeps => ({
   cwd: process.cwd(),
   fetch,
   createSigner: createTestSigner,
-  listen: (signer) => openTestListener(signer),
+  listen: (signer, inbox) => openTestListener(signer, inbox),
   now: () => Date.now(),
 });
 
@@ -161,9 +163,13 @@ export async function runTest(
   const call = await prepareTestCall(parsed, deps.cwd, output);
   if (call === undefined) return 1;
 
-  // 5. A key for this one request, and the listener that vouches for it.
+  // 5. A key for this one request, and the listener that vouches for it
+  // and takes its notifications.
   const signer = deps.createSigner();
-  const listening = await deps.listen(signer);
+  const inbox = createNotificationInbox((result) =>
+    checkResult(result, call.service.output_schema)
+  );
+  const listening = await deps.listen(signer, inbox);
   if (!listening.ok) {
     output.err(failure(output, listening.message));
     return 1;

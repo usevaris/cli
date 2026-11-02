@@ -65,7 +65,13 @@ import {
   randomUUID,
   sign,
 } from "node:crypto";
-import { createServer, type Server } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import type { NotificationAnswer, NotificationInbox } from "./test-notifications.ts";
 
 /** The key ID on every test request. The SDK routes on it. */
 export const TEST_KEY_ID = "varis-test";
@@ -86,6 +92,12 @@ export const TEST_REQUEST_ID_PREFIX = "var_tst_req_";
 export const LISTENER_HOST = "127.0.0.1";
 export const LISTENER_PORT = 47823;
 export const LISTENER_PATH = "/varis-test-key";
+
+/**
+ * Where the listener takes the call's notifications, as
+ * `?invocation_id=<id>`: LOCAL_TEST_NOTIFICATIONS_URL in the SDK.
+ */
+export const LISTENER_NOTIFICATIONS_PATH = "/varis-test-notifications";
 
 /**
  * Every test invocation ID starts with this. Gateway invocation IDs start
@@ -187,22 +199,28 @@ export type ListenResult =
 
 /**
  * Serves `signer`'s public key at the fixed loopback address, for its
- * request ID only. Every other path or request ID gets a 404, so the
- * listener confirms exactly one request and nothing else.
+ * request ID only, and takes the call's notifications into `inbox`. Every
+ * other path gets a 404, so the listener answers for exactly one call and
+ * nothing else.
  */
 export function openTestListener(
   signer: TestSigner,
+  inbox: NotificationInbox,
   port = LISTENER_PORT,
 ): Promise<ListenResult> {
   let fetches = 0;
 
   const server: Server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", `http://${LISTENER_HOST}`);
-    const asked = url.searchParams.get("request_id");
+
+    if (request.method === "POST" && url.pathname === LISTENER_NOTIFICATIONS_PATH) {
+      void receiveNotification(signer, inbox, url, request, response);
+      return;
+    }
 
     if (
       request.method !== "GET" || url.pathname !== LISTENER_PATH ||
-      asked !== signer.requestId
+      url.searchParams.get("request_id") !== signer.requestId
     ) {
       response.writeHead(404, { "Content-Type": "text/plain" }).end("unknown");
       return;
@@ -243,5 +261,48 @@ export function openTestListener(
         },
       });
     });
+  });
+}
+
+/**
+ * One notification. It must name this call's invocation and carry the token
+ * sent with it, as the route requires; otherwise it gets a 401, as a wrong
+ * token or another invocation's token does from Varis.
+ */
+async function receiveNotification(
+  signer: TestSigner,
+  inbox: NotificationInbox,
+  url: URL,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const token = request.headers.authorization?.match(/^Bearer (\S+)$/)?.[1];
+  const authorised = token === signer.notificationToken &&
+    url.searchParams.get("invocation_id") === signer.invocationId;
+
+  let answer: NotificationAnswer;
+  if (!authorised) {
+    // Drained so the connection can be reused, but never read.
+    request.resume();
+    answer = inbox.refuseUnauthorised();
+  } else {
+    try {
+      answer = inbox.receive(await readBody(request));
+    } catch {
+      // The connection dropped mid-body: nothing to answer.
+      return;
+    }
+  }
+  response
+    .writeHead(answer.status, { "Content-Type": "application/json" })
+    .end(JSON.stringify(answer.body));
+}
+
+function readBody(request: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    request.on("error", reject);
   });
 }
