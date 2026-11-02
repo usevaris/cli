@@ -328,6 +328,7 @@ async function runTestCall(
 ): Promise<number> {
   output.err(`${bold(output, call.method)} ${call.target.href}`);
   output.err(dim(output, `Request ID ${signer.requestId}`));
+  output.err(dim(output, `Invocation ID ${signer.invocationId}`));
 
   const started = deps.now();
   const outcome = await sendTestCall(call, signer, deps.fetch);
@@ -354,6 +355,7 @@ async function sendTestCall(
       method,
       headers: {
         ...signer.sign({
+          invocationId: signer.invocationId,
           method,
           // Signed exactly as the URL goes out: URL serialises the path and
           // query the same way the gateway does.
@@ -362,6 +364,10 @@ async function sendTestCall(
         }),
         Accept: "application/json",
         "User-Agent": `varis-cli/${VERSION} (varis test)`,
+        "X-Varis-Invocation-Id": signer.invocationId,
+        // Not signed, as the gateway sends it. The SDK sends notifications
+        // for this call back to the listener with it.
+        "X-Varis-Notification-Token": signer.notificationToken,
         // The gateway sends Content-Type only with a body. So does the test,
         // so a handler that trips over it fails here, not in production.
         ...(method === "POST" && { "Content-Type": "application/json" }),
@@ -563,10 +569,15 @@ function reportStatus(
       );
     } else {
       // The key was fetched, so the signature was checked and didn't match:
-      // the request changed between the wire and verifyRequest.
+      // the SDK predates the invocation ID in the signed string, or the
+      // request changed between the wire and verifyRequest.
       output.err(
         yellow(output, "Your server fetched the test key, but the signature didn't match. Usually one of:"),
       );
+      output.err(
+        "  - your server uses @usevaris/sdk older than 1.2.0, which doesn't check the invocation ID Varis signs.",
+      );
+      output.err("    Upgrade it: npm install @usevaris/sdk@latest");
       output.err("  - middleware rewrote the path or query before verifyRequest saw it;");
       output.err("  - the body was read or parsed before calling verifyRequest.");
       output.err("verifyRequest must see the request exactly as it arrived.");

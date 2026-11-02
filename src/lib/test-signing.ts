@@ -2,7 +2,7 @@
 // that they came from this CLI.
 //
 // THE PROBLEM
-// Every Varis service calls `varis.verifyRequest(request)` before it does
+// Every Varis service calls `varis.requests.verify(request)` before it does
 // anything, and rejects requests Varis didn't sign. A real request is signed
 // by the Varis gateway with a private key only Varis holds. `varis test`
 // calls the developer's server directly, before the service is published, so
@@ -14,17 +14,24 @@
 // For each test run, this file:
 //   1. makes a brand-new Ed25519 key pair, used for this one request and
 //      then thrown away;
-//   2. signs the request with the private half, over exactly the string the
-//      gateway signs: `${timestamp}.${method}.${pathAndQuery}.${rawBody}`;
-//   3. sends it with the key ID `varis-test` and a request ID prefixed
+//   2. makes a test invocation ID prefixed `var_tst_invk_` and a test
+//      notification token prefixed `var_nt_test_`;
+//   3. signs the request with the private half, over exactly the string the
+//      gateway signs:
+//      `${timestamp}.${invocationId}.${method}.${pathAndQuery}.${rawBody}`;
+//   4. sends it with the key ID `varis-test` and a request ID prefixed
 //      `var_tst_req_`;
-//   4. meanwhile listens on one fixed loopback address,
-//      http://127.0.0.1:47823/varis-test-key, and hands out the public half,
-//      but only when asked for the request ID it just sent.
+//   5. meanwhile listens on one fixed loopback address, 127.0.0.1:47823,
+//      and hands out the public half at /varis-test-key, but only when asked
+//      for the request ID it just sent. The same listener takes the call's
+//      notifications at /varis-test-notifications, but only with the token
+//      it just issued.
 //
-// When the SDK's verifyRequest sees the `varis-test` key ID, it fetches the
-// public key from that loopback address and checks the signature with it.
-// See packages/sdk/src/verify.ts in the varis-ts repository.
+// When the SDK's requests.verify sees the `varis-test` key ID, it fetches
+// the public key from that loopback address and checks the signature with
+// it. When it sends a notification for a test request, it sends it to the
+// loopback too, never to Varis. See packages/sdk/src/verify.ts and
+// packages/sdk/src/notifications.ts in the varis-ts repository.
 //
 // WHY THIS IS SAFE
 // The fixed loopback address is the whole guarantee. 127.0.0.1 always means
@@ -50,7 +57,7 @@
 //
 // KEEP IN STEP WITH THE SDK
 // TEST_KEY_ID, TEST_REQUEST_ID_PREFIX, and the listener's host, port, and
-// path must match packages/sdk/src/constants.ts in varis-ts exactly.
+// paths must match packages/sdk/src/constants.ts in varis-ts exactly.
 
 import {
   generateKeyPairSync,
@@ -80,9 +87,25 @@ export const LISTENER_HOST = "127.0.0.1";
 export const LISTENER_PORT = 47823;
 export const LISTENER_PATH = "/varis-test-key";
 
+/**
+ * Every test invocation ID starts with this. Gateway invocation IDs start
+ * with `var_invk_`, so a test call never looks like a real one in a
+ * provider's logs.
+ */
+export const TEST_INVOCATION_ID_PREFIX = "var_tst_invk_";
+
+/**
+ * Every test notification token starts with this. It works only against
+ * this listener, during this one test.
+ */
+export const TEST_NOTIFICATION_TOKEN_PREFIX = "var_nt_test_";
+
 /** Everything needed to sign and vouch for one test request. */
 export type TestSigner = {
   requestId: string;
+  invocationId: string;
+  /** Sent as X-Varis-Notification-Token; notifications must carry it back. */
+  notificationToken: string;
   /** The public key, as the listener serves it: SPKI PEM. */
   publicKeyPem: string;
   /** The signature headers for the exact bytes about to be sent. */
@@ -90,6 +113,7 @@ export type TestSigner = {
 };
 
 export type SignedRequest = {
+  invocationId: string;
   method: "GET" | "POST";
   /** The path and query exactly as sent, for example "/v1/weather?city=Lagos". */
   pathAndQuery: string;
@@ -103,12 +127,12 @@ export type SignedRequest = {
  * same verification a real call does.
  */
 export function signedString(timestamp: string, request: SignedRequest): string {
-  return `${timestamp}.${request.method}.${request.pathAndQuery}.${request.rawBody}`;
+  return `${timestamp}.${request.invocationId}.${request.method}.${request.pathAndQuery}.${request.rawBody}`;
 }
 
 /**
- * A fresh key pair and request ID for one test. Nothing is written to disk;
- * when the test ends, the private key is gone.
+ * A fresh key pair, request ID, invocation ID, and notification token for
+ * one test. Nothing is written to disk; when the test ends, all are gone.
  */
 export function createTestSigner(): TestSigner {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
@@ -116,6 +140,8 @@ export function createTestSigner(): TestSigner {
 
   return {
     requestId,
+    invocationId: `${TEST_INVOCATION_ID_PREFIX}${randomUUID()}`,
+    notificationToken: `${TEST_NOTIFICATION_TOKEN_PREFIX}${randomUUID()}`,
     publicKeyPem: publicKey.export({ type: "spki", format: "pem" }).toString(),
     sign: (request) => signHeaders(privateKey, requestId, request),
   };

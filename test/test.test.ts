@@ -72,13 +72,21 @@ type Seen = { method: string; url: string; headers: IncomingMessage["headers"]; 
 type Handler = (seen: Seen) => { status: number; body: unknown; headers?: Record<string, string> };
 
 /**
- * A provider server. With `verifies`, it checks each request as the SDK
- * does: the test key ID must come with a test request ID, the public key is
- * fetched from the listener for that request ID, and the signature must
- * cover the timestamp, method, path and query, and body. A request that
- * fails gets a 401, as a handler calling verifyRequest would send.
+ * How the provider's SDK checks a signature: `current` is SDK 1.2.0 and
+ * later, over D18's string with the invocation ID; `old` is SDK 1.1.0 and
+ * earlier, without it.
  */
-function provider(keyPort: number, handler: Handler, verifies = true) {
+type Verifier = "current" | "old" | false;
+
+/**
+ * A provider server. Unless `verifies` is false, it checks each request as
+ * the SDK does: the test key ID must come with a test request ID, the public
+ * key is fetched from the listener for that request ID, and the signature
+ * must cover the timestamp, invocation ID, method, path and query, and body.
+ * A request that fails gets a 401, as a handler calling verifyRequest would
+ * send.
+ */
+function provider(keyPort: number, handler: Handler, verifies: Verifier = "current") {
   const seen: Seen[] = [];
   const server: Server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -91,7 +99,7 @@ function provider(keyPort: number, handler: Handler, verifies = true) {
     };
     seen.push(current);
 
-    if (verifies && !(await verifies_(current, keyPort))) {
+    if (verifies && !(await verifies_(current, keyPort, verifies))) {
       response.writeHead(401, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: "unauthorised" }));
       return;
@@ -104,8 +112,12 @@ function provider(keyPort: number, handler: Handler, verifies = true) {
   return { server, seen };
 }
 
-/** The SDK's verifyRequest, cut down to the test-key path. */
-async function verifies_(seen: Seen, keyPort: number): Promise<boolean> {
+/**
+ * The SDK's verifyRequest, cut down to the test-key path. The signed string
+ * is written out here rather than taken from signedString, so a change to
+ * either shows up as a failing test.
+ */
+async function verifies_(seen: Seen, keyPort: number, verifier: "current" | "old"): Promise<boolean> {
   const keyId = seen.headers["x-varis-key-id"];
   const requestId = String(seen.headers["x-varis-request-id"] ?? "");
   if (keyId !== TEST_KEY_ID || !requestId.startsWith(TEST_REQUEST_ID_PREFIX)) return false;
@@ -117,11 +129,11 @@ async function verifies_(seen: Seen, keyPort: number): Promise<boolean> {
   const key = (await answer.json()) as { kid: string; public_key_pem: string };
   if (key.kid !== TEST_KEY_ID) return false;
 
-  const message = signedString(String(seen.headers["x-varis-timestamp"]), {
-    method: seen.method as "GET" | "POST",
-    pathAndQuery: seen.url,
-    rawBody: seen.body,
-  });
+  const timestamp = String(seen.headers["x-varis-timestamp"]);
+  const invocationId = String(seen.headers["x-varis-invocation-id"]);
+  const message = verifier === "current"
+    ? `${timestamp}.${invocationId}.${seen.method}.${seen.url}.${seen.body}`
+    : `${timestamp}.${seen.method}.${seen.url}.${seen.body}`;
   return verify(
     null,
     Buffer.from(message),
@@ -327,6 +339,34 @@ describe("varis test", () => {
     expect(result.err).toContain("fetched the test key, but the signature didn't match");
   });
 
+  it("fails a server on an SDK that signs without the invocation ID, and says to upgrade", async () => {
+    const p = provider(keyPort, () => ({ status: 200, body: { temp_c: 1 } }), "old");
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("fetched the test key, but the signature didn't match");
+    expect(result.err).toContain("older than 1.2.0");
+    expect(result.err).toContain("npm install @usevaris/sdk@latest");
+  });
+
+  it("sends the invocation ID and notification token, as the gateway does", async () => {
+    const p = provider(keyPort, () => ({ status: 200, body: { temp_c: 1 } }));
+    await manifest(await start(p));
+    const signer = createTestSigner();
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}'], {
+      createSigner: () => signer,
+    });
+
+    expect(result.code).toBe(0);
+    const headers = p.seen[0]!.headers;
+    expect(headers["x-varis-invocation-id"]).toBe(signer.invocationId);
+    expect(headers["x-varis-notification-token"]).toBe(signer.notificationToken);
+    expect(result.err).toContain(`Invocation ID ${signer.invocationId}`);
+  });
+
   it("stops before sending an input that breaks the schema", async () => {
     const p = provider(keyPort, () => ({ status: 200, body: { temp_c: 1 } }));
     await manifest(await start(p));
@@ -432,6 +472,42 @@ describe("varis test", () => {
     expect((await run([])).code).toBe(2);
     expect((await run(["a", "b"])).code).toBe(2);
     expect((await run(["a", "--input", "{}", "--input-file", "x"])).code).toBe(2);
+  });
+});
+
+describe("the test signer", () => {
+  it("makes test IDs and a test token that can't be mistaken for real ones", () => {
+    const signer = createTestSigner();
+
+    expect(signer.requestId).toMatch(/^var_tst_req_[0-9a-f-]{36}$/);
+    expect(signer.invocationId).toMatch(/^var_tst_invk_[0-9a-f-]{36}$/);
+    expect(signer.notificationToken).toMatch(/^var_nt_test_[0-9a-f-]{36}$/);
+    expect(createTestSigner().invocationId).not.toBe(signer.invocationId);
+  });
+
+  it("signs D18's string: timestamp, invocation ID, method, path and query, body", () => {
+    const request = {
+      invocationId: "var_tst_invk_1",
+      method: "POST" as const,
+      pathAndQuery: "/v1/summarise?x=1",
+      rawBody: '{"text":"hi"}',
+    };
+    expect(signedString("1700000000", request)).toBe(
+      '1700000000.var_tst_invk_1.POST./v1/summarise?x=1.{"text":"hi"}',
+    );
+
+    const signer = createTestSigner();
+    const headers = signer.sign(request);
+    expect(
+      verify(
+        null,
+        Buffer.from(signedString(headers["X-Varis-Timestamp"]!, request)),
+        signer.publicKeyPem,
+        Buffer.from(headers["X-Varis-Signature"]!, "base64"),
+      ),
+    ).toBe(true);
+    expect(headers["X-Varis-Key-Id"]).toBe(TEST_KEY_ID);
+    expect(headers["X-Varis-Request-Id"]).toBe(signer.requestId);
   });
 });
 
