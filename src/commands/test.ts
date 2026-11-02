@@ -49,17 +49,22 @@ import { toQueryString } from "../lib/query-string.ts";
 import { type SchemaProblem, validate } from "../lib/schema.ts";
 import { bold, dim, failure, success, yellow } from "../lib/style.ts";
 import {
+  type FailureCause,
+  judgeAnswer,
+  judgeError,
+  type Outcome,
+  PROVIDER_TIMEOUT_MS,
+} from "../lib/test-outcome.ts";
+import {
   createTestSigner,
   LISTENER_HOST,
   LISTENER_PORT,
   type ListenResult,
-  listenForKeyRequests,
+  openTestListener,
+  type TestListener,
   type TestSigner,
 } from "../lib/test-signing.ts";
 import { VERSION } from "../lib/version.ts";
-
-/** The gateway gives a provider this long to answer, so the test does too. */
-const TIMEOUT_MS = 30_000;
 
 /** A response body is shown up to this many characters, then cut. */
 const MAX_SHOWN_BODY = 2_000;
@@ -81,7 +86,7 @@ const defaultDeps = (): TestDeps => ({
   cwd: process.cwd(),
   fetch,
   createSigner: createTestSigner,
-  listen: (signer) => listenForKeyRequests(signer),
+  listen: (signer) => openTestListener(signer),
   now: () => Date.now(),
 });
 
@@ -127,6 +132,19 @@ function parseCommandArgs(args: string[]): Args | { error: string } {
   }
 }
 
+/**
+ * A service from varis.json, ready to call on the developer's server: the
+ * request exactly as the gateway would send it.
+ */
+type TestCall = {
+  slug: string;
+  service: ManifestService;
+  method: "GET" | "POST";
+  target: URL;
+  /** The exact body bytes, both signed and sent. Empty for GET. */
+  rawBody: string;
+};
+
 export async function runTest(
   args: string[],
   output: Output,
@@ -138,15 +156,63 @@ export async function runTest(
     return 2;
   }
 
-  // 1. The service, and where the developer's server runs.
-  const found = await readManifest(deps.cwd);
+  const call = await prepareTestCall(parsed, deps.cwd, output);
+  if (call === undefined) return 1;
+
+  // 5. A key for this one request, and the listener that vouches for it.
+  const signer = deps.createSigner();
+  const listening = await deps.listen(signer);
+  if (!listening.ok) {
+    output.err(failure(output, listening.message));
+    return 1;
+  }
+
+  // The listener stays open for the whole run, because the server fetches
+  // the key while handling the request. It closes in `finally`, whatever
+  // happens, so the port is free for the next test and the process can exit.
+  try {
+    return await runTestCall(call, signer, listening.listener, output, deps);
+  } finally {
+    await listening.listener.close();
+  }
+}
+
+/**
+ * Steps 1 to 4: the service, its test URL, and its input, checked and built
+ * into the request. Undefined after saying what's wrong; nothing is sent.
+ */
+async function prepareTestCall(
+  parsed: Args,
+  cwd: string,
+  output: Output,
+): Promise<TestCall | undefined> {
+  const found = await readTestService(parsed.slug, cwd, output);
+  if (found === undefined) return undefined;
+
+  const input = await readInput(parsed, found.service, cwd, output);
+  if (input === undefined) return undefined;
+  if (!checkInput(parsed.slug, found.service, input, output)) return undefined;
+
+  return buildTestCall(parsed.slug, found.service, found.target, input, output);
+}
+
+/**
+ * Steps 1 and 2: the service from varis.json, and the URL a test sends it
+ * to on the developer's server.
+ */
+async function readTestService(
+  slug: string,
+  cwd: string,
+  output: Output,
+): Promise<{ service: ManifestService; target: URL } | undefined> {
+  const found = await readManifest(cwd);
   if (found.status === "missing") {
     output.err(failure(output, `No ${MANIFEST_FILE} in this folder. Run varis init first.`));
-    return 1;
+    return undefined;
   }
   if (found.status === "invalid") {
     output.err(failure(output, `${MANIFEST_FILE} can't be read: ${found.reason}.`));
-    return 1;
+    return undefined;
   }
   const manifest = found.manifest;
 
@@ -157,108 +223,134 @@ export async function runTest(
     );
     output.err("");
     output.err("  varis init --test-base-url http://localhost:3000");
-    return 1;
+    return undefined;
   }
 
   const services = (manifest.services ?? []) as ManifestService[];
-  const service = services.find((s) => s?.slug === parsed.slug);
+  const service = services.find((s) => s?.slug === slug);
   if (!service) {
     output.err(
       failure(
         output,
-        `${MANIFEST_FILE} has no service with the slug ${parsed.slug}. If you just defined it, run varis build.`,
+        `${MANIFEST_FILE} has no service with the slug ${slug}. If you just defined it, run varis build.`,
       ),
     );
-    return 1;
+    return undefined;
   }
 
-  // 2. The URL. endpoint_url is where the service runs in production; a test
-  // goes to the developer's server instead, by swapping base_url for
-  // test_base_url (testUrlFor explains the fallback). endpoint_url never
-  // carries a query string: publish forbids one, because the gateway owns the
-  // query of a GET service.
-  let target: URL;
+  // endpoint_url is where the service runs in production; a test goes to
+  // the developer's server instead, by swapping base_url for test_base_url
+  // (testUrlFor explains the fallback). endpoint_url never carries a query
+  // string: publish forbids one, because the gateway owns the query of a
+  // GET service.
   try {
-    target = testUrlFor(
+    const target = testUrlFor(
       String(service.endpoint_url),
       typeof manifest.base_url === "string" ? manifest.base_url : undefined,
       manifest.test_base_url,
     );
+    return { service, target };
   } catch {
     output.err(
       failure(
         output,
-        `Can't build a test URL from ${parsed.slug}'s endpoint_url and test_base_url. Check both in ${MANIFEST_FILE}.`,
+        `Can't build a test URL from ${slug}'s endpoint_url and test_base_url. Check both in ${MANIFEST_FILE}.`,
       ),
     );
-    return 1;
+    return undefined;
   }
+}
 
-  // 3. The input, checked before anything is sent, as the gateway checks it.
-  const input = await readInput(parsed, service, deps.cwd, output);
-  if (input === undefined) return 1;
-
+/** Step 3: the input, checked before anything is sent, as the gateway checks it. */
+function checkInput(
+  slug: string,
+  service: ManifestService,
+  input: unknown,
+  output: Output,
+): boolean {
   const inputCheck = validate(service.input_schema ?? {}, input);
-  if (!inputCheck.ok) {
-    if ("invalidSchema" in inputCheck) {
-      output.err(
-        failure(output, `${parsed.slug}'s input schema is invalid: ${inputCheck.invalidSchema}`),
-      );
-    } else {
-      output.err(
-        failure(output, `The input doesn't match ${parsed.slug}'s input schema, so nothing was sent.`),
-      );
-      printProblems(inputCheck.problems, output);
-    }
-    return 1;
-  }
+  if (inputCheck.ok) return true;
 
-  // 4. The request, built exactly as the gateway builds it. varis.json
-  // writes GET or POST; anything else is treated as the API's default, GET.
-  const method = service.method === "POST" ? "POST" : "GET";
-  let rawBody = "";
-  if (method === "GET") {
-    try {
-      target.search = toQueryString(input, service.input_schema);
-    } catch (error) {
-      output.err(
-        failure(
-          output,
-          `${parsed.slug} is a GET service, so its input must fit in a query string: ${
-            error instanceof Error ? error.message : String(error)
-          }.`,
-        ),
-      );
-      return 1;
-    }
+  if ("invalidSchema" in inputCheck) {
+    output.err(
+      failure(output, `${slug}'s input schema is invalid: ${inputCheck.invalidSchema}`),
+    );
   } else {
+    output.err(
+      failure(output, `The input doesn't match ${slug}'s input schema, so nothing was sent.`),
+    );
+    printProblems(inputCheck.problems, output);
+  }
+  return false;
+}
+
+/**
+ * Step 4: the request, built exactly as the gateway builds it. varis.json
+ * writes GET or POST; anything else is treated as the API's default, GET.
+ */
+function buildTestCall(
+  slug: string,
+  service: ManifestService,
+  target: URL,
+  input: unknown,
+  output: Output,
+): TestCall | undefined {
+  const method = service.method === "POST" ? "POST" : "GET";
+  if (method === "POST") {
     // Serialised once. These exact bytes are both signed and sent: sending a
     // second serialisation could differ, and the signature would fail.
-    rawBody = JSON.stringify(input);
+    return { slug, service, method, target, rawBody: JSON.stringify(input) };
   }
 
-  // 5. A key for this one request, and the listener that vouches for it.
-  const signer = deps.createSigner();
-  const listening = await deps.listen(signer);
-  if (!listening.ok) {
-    output.err(failure(output, listening.message));
-    return 1;
+  try {
+    target.search = toQueryString(input, service.input_schema);
+  } catch (error) {
+    output.err(
+      failure(
+        output,
+        `${slug} is a GET service, so its input must fit in a query string: ${
+          error instanceof Error ? error.message : String(error)
+        }.`,
+      ),
+    );
+    return undefined;
   }
-  const { listener } = listening;
+  return { slug, service, method, target, rawBody: "" };
+}
 
-  output.err(`${bold(output, method)} ${target.href}`);
+/** Steps 6 and 7: sends the call, then judges the answer as the gateway would. */
+async function runTestCall(
+  call: TestCall,
+  signer: TestSigner,
+  listener: TestListener,
+  output: Output,
+  deps: TestDeps,
+): Promise<number> {
+  output.err(`${bold(output, call.method)} ${call.target.href}`);
   output.err(dim(output, `Request ID ${signer.requestId}`));
 
-  // 6. Send it. The listener stays open until the whole response has
-  // arrived, because the server fetches the key while handling the request.
-  // It closes in `finally`, whatever happens, so the port is free for the
-  // next test and the process can exit.
   const started = deps.now();
-  let response: Response;
-  let text: string;
-  let keyFetches: number;
+  const outcome = await sendTestCall(call, signer, deps.fetch);
+  const elapsed = deps.now() - started;
+
+  if (outcome.status === "failed") {
+    return reportFailure(call, outcome.cause, listener.fetches(), output);
+  }
+  return reportSuccess(call, outcome.statusCode, outcome.payload, elapsed, output);
+}
+
+/**
+ * Signs and sends the call, with the gateway's 30-second timeout and no
+ * redirects, and judges what comes back.
+ */
+async function sendTestCall(
+  call: TestCall,
+  signer: TestSigner,
+  fetcher: typeof fetch,
+): Promise<Outcome> {
+  const { method, target, rawBody } = call;
   try {
-    response = await deps.fetch(target.href, {
+    const response = await fetcher(target.href, {
       method,
       headers: {
         ...signer.sign({
@@ -279,62 +371,77 @@ export async function runTest(
       // signed request somewhere the provider never meant. A service that
       // redirects fails in production, so it fails here too.
       redirect: "manual",
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
     });
-    text = await response.text();
+    const text = await response.text();
+    return judgeAnswer(response, text, call.service.output_schema);
   } catch (error) {
-    return reportUnreachable(error, target, listener.fetches(), output);
-  } finally {
-    keyFetches = listener.fetches();
-    await listener.close();
+    return judgeError(error);
   }
-  const elapsed = deps.now() - started;
+}
 
-  // 7. Judge the response the way the gateway would.
-  if (response.status < 200 || response.status >= 300) {
-    return reportStatus(response, text, keyFetches, output);
-  }
-
-  let payload: unknown;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    output.err(
-      failure(
-        output,
-        `Your server answered ${response.status}, but not with JSON. Varis would count this as a failed call and refund it.`,
-      ),
-    );
-    showBody(text, output);
-    return 1;
-  }
-
-  const outputCheck = validate(service.output_schema ?? {}, payload);
-  if (!outputCheck.ok) {
-    if ("invalidSchema" in outputCheck) {
-      output.err(
-        failure(output, `${parsed.slug}'s output schema is invalid: ${outputCheck.invalidSchema}`),
-      );
-      return 1;
-    }
-    output.err(
-      failure(
-        output,
-        `The response doesn't match ${parsed.slug}'s output schema. Varis would count this as a failed call and refund it.`,
-      ),
-    );
-    printProblems(outputCheck.problems, output);
-    showBody(JSON.stringify(payload, null, 2), output);
-    return 1;
-  }
-
+/** The output matched its schema: the call passed. */
+function reportSuccess(
+  call: TestCall,
+  statusCode: number,
+  payload: unknown,
+  elapsed: number,
+  output: Output,
+): number {
   output.err(
-    success(output, `${parsed.slug} passed: ${response.status} in ${elapsed} ms, and the output matches its schema.`),
+    success(output, `${call.slug} passed: ${statusCode} in ${elapsed} ms, and the output matches its schema.`),
   );
   // Messages go to stderr and the output alone to stdout, so
   // `varis test weather | jq .temp_c` works.
   output.out(JSON.stringify(payload, null, 2));
   return 0;
+}
+
+/** Says what would make a real call fail, and how to fix it. */
+function reportFailure(
+  call: TestCall,
+  cause: FailureCause,
+  keyFetches: number,
+  output: Output,
+): number {
+  switch (cause.kind) {
+    case "no_answer":
+      output.err(
+        failure(
+          output,
+          `Your server didn't answer within ${PROVIDER_TIMEOUT_MS / 1000} seconds. Varis would count this as a timeout and refund the call.`,
+        ),
+      );
+      return 1;
+    case "unreachable":
+      return reportUnreachable(call.target, keyFetches, output);
+    case "status":
+      return reportStatus(cause.response, cause.text, keyFetches, output);
+    case "not_json":
+      output.err(
+        failure(
+          output,
+          `Your server answered ${cause.statusCode}, but not with JSON. Varis would count this as a failed call and refund it.`,
+        ),
+      );
+      showBody(cause.text, output);
+      return 1;
+    case "invalid_schema":
+      output.err(
+        failure(output, `${call.slug}'s output schema is invalid: ${cause.message}`),
+      );
+      return 1;
+    case "schema_mismatch":
+      output.err(
+        failure(
+          output,
+          `The response doesn't match ${call.slug}'s output schema. Varis would count this as a failed call and refund it.`,
+        ),
+      );
+      printProblems(cause.problems, output);
+      showBody(JSON.stringify(cause.payload, null, 2), output);
+      return 1;
+  }
 }
 
 /**
@@ -392,23 +499,12 @@ function exampleInput(required: unknown[]): string {
   return JSON.stringify(Object.fromEntries(required.map((key) => [String(key), "…"])));
 }
 
-/** fetch threw: the server is down, unreachable, or too slow. */
+/** The connection failed: the server is down or unreachable. */
 function reportUnreachable(
-  error: unknown,
   target: URL,
   keyFetches: number,
   output: Output,
 ): number {
-  const name = (error as { name?: unknown } | null)?.name;
-  if (name === "TimeoutError" || name === "AbortError") {
-    output.err(
-      failure(
-        output,
-        `Your server didn't answer within ${TIMEOUT_MS / 1000} seconds. Varis would count this as a timeout and refund the call.`,
-      ),
-    );
-    return 1;
-  }
   output.err(
     failure(
       output,

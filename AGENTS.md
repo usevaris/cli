@@ -32,6 +32,8 @@ varis-cli/
 ├── src/lib/generator.ts  Language markers, running a generator, reading its contract.
 ├── src/lib/test-signing.ts  varis test's throwaway signing key and loopback key
 │                         listener. Must match the SDK's constants.
+├── src/lib/test-outcome.ts  What the gateway makes of a provider's answer.
+│                         Mirrors callProvider in the varis repository.
 ├── src/lib/query-string.ts  GET input as a query string, exactly as the gateway.
 ├── src/lib/schema.ts     JSON Schema validation, configured like the gateway.
 ├── src/lib/install-channel.ts  How this copy was installed: Homebrew, Scoop, script.

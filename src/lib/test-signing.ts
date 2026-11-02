@@ -148,14 +148,14 @@ function signHeaders(
  * A running listener. Always close it: an open listener keeps the process
  * alive and holds the port for the next test.
  */
-export type TestKeyListener = {
+export type TestListener = {
   /** How many times the key was fetched, so a failure can say whether the server asked. */
   fetches: () => number;
   close: () => Promise<void>;
 };
 
 export type ListenResult =
-  | { ok: true; listener: TestKeyListener }
+  | { ok: true; listener: TestListener }
   /** The port is taken, most likely by another varis test still running. */
   | { ok: false; reason: "port_in_use" | "failed"; message: string };
 
@@ -164,7 +164,7 @@ export type ListenResult =
  * request ID only. Every other path or request ID gets a 404, so the
  * listener confirms exactly one request and nothing else.
  */
-export function listenForKeyRequests(
+export function openTestListener(
   signer: TestSigner,
   port = LISTENER_PORT,
 ): Promise<ListenResult> {

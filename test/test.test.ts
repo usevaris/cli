@@ -16,7 +16,7 @@ import type { Output } from "../src/lib/output.ts";
 import {
   createTestSigner,
   LISTENER_PATH,
-  listenForKeyRequests,
+  openTestListener,
   signedString,
   TEST_KEY_ID,
   TEST_REQUEST_ID_PREFIX,
@@ -183,7 +183,7 @@ async function run(args: string[], overrides: Partial<TestDeps> = {}) {
     cwd: project,
     fetch,
     createSigner: createTestSigner,
-    listen: (signer) => listenForKeyRequests(signer, keyPort),
+    listen: (signer) => openTestListener(signer, keyPort),
     now: () => 0,
     ...overrides,
   };
@@ -438,7 +438,7 @@ describe("varis test", () => {
 describe("the key listener", () => {
   it("serves the key only for the request it signed", async () => {
     const signer = createTestSigner();
-    const listening = await listenForKeyRequests(signer, keyPort);
+    const listening = await openTestListener(signer, keyPort);
     if (!listening.ok) throw new Error(listening.message);
     try {
       const base = `http://127.0.0.1:${keyPort}${LISTENER_PATH}`;
