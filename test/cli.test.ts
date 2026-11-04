@@ -83,6 +83,59 @@ describe("a command that crashes", () => {
   });
 });
 
+describe("the update notice", () => {
+  it("prints after the command's own output, on stderr, when a newer varis is out", async () => {
+    const spy = vi.spyOn(publish, "run").mockImplementation(async (_args, output) => {
+      output.out("published");
+      return 0;
+    });
+    const asked: string[] = [];
+    const { output, out, err } = capture();
+
+    const code = await runCli(["publish"], output, {
+      checkForUpdate: async (command) => {
+        asked.push(command);
+        return "9.0.0";
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(asked).toEqual(["publish"]);
+    expect(out).toEqual(["published"]);
+    expect(err).toEqual(["", `A newer varis is available: 9.0.0 (you have ${VERSION}). Run varis upgrade.`]);
+    spy.mockRestore();
+  });
+
+  it("keeps the command's exit code, and prints after a failure too", async () => {
+    const spy = vi.spyOn(publish, "run").mockResolvedValue(1);
+    const { output, err } = capture();
+
+    expect(await runCli(["publish"], output, { checkForUpdate: async () => "9.0.0" })).toBe(1);
+    expect(err.at(-1)).toContain("Run varis upgrade.");
+    spy.mockRestore();
+  });
+
+  it("prints nothing when there's no newer version", async () => {
+    const spy = vi.spyOn(publish, "run").mockResolvedValue(0);
+    const { output, err } = capture();
+
+    await runCli(["publish"], output, { checkForUpdate: async () => null });
+
+    expect(err).toEqual([]);
+    spy.mockRestore();
+  });
+
+  it("doesn't check for help, the version, or an unknown command", async () => {
+    let checks = 0;
+    const deps = { checkForUpdate: async () => (checks++, "9.0.0") };
+
+    for (const argv of [["--help"], ["--version"], ["publish", "--help"], ["invoke"]]) {
+      await runCli(argv, capture().output, deps);
+    }
+    expect(checks).toBe(0);
+  });
+});
+
 describe("apiOrigin", () => {
   it("defaults to the Varis API", () => {
     expect(apiOrigin({})).toBe(VARIS_API_ORIGIN);

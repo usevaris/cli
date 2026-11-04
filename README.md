@@ -59,6 +59,14 @@ download against the release's `SHA256SUMS`, and adds the folder to your
 example `VARIS_VERSION=0.2.0`. Each script's header lists its other
 settings.
 
+## Updates
+
+Once a day, the CLI checks GitHub for a newer release. When there is one, it
+prints a line after your command: "A newer varis is available: 1.1.0 (you
+have 1.0.2). Run varis upgrade." It never checks in CI, when its output
+isn't a terminal, or during `varis test`. To turn the check off, set
+`VARIS_NO_UPDATE_CHECK=1`.
+
 ## Report a problem
 
 Open an issue on [GitHub](https://github.com/usevaris/varis-cli/issues).

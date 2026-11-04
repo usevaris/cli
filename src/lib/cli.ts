@@ -9,6 +9,7 @@ import { dracarys } from "../commands/dracarys.ts";
 import type { Command } from "./command.ts";
 import type { Output } from "./output.ts";
 import { reportLines } from "./issues.ts";
+import { updateNotice } from "./update-check.ts";
 import { VERSION } from "./version.ts";
 
 /**
@@ -50,12 +51,27 @@ Options:
 New here? Run varis publish in your project; it walks you through the rest.`;
 }
 
+export type CliDeps = {
+  /**
+   * Checks for a newer varis while `command` runs, resolving to the version
+   * to announce, or null. src/lib/update-check.ts; the entry point passes
+   * the real one, and without it nothing is checked.
+   */
+  checkForUpdate: (command: string) => Promise<string | null>;
+};
+
+const noUpdateCheck: CliDeps = { checkForUpdate: async () => null };
+
 /**
  * Runs the CLI for `argv`, the arguments after `varis`, and returns the exit
  * code. The entry point (src/cli.ts) is the only caller that touches the
  * process; everything here writes through `output`.
  */
-export async function runCli(argv: string[], output: Output): Promise<number> {
+export async function runCli(
+  argv: string[],
+  output: Output,
+  deps: CliDeps = noUpdateCheck,
+): Promise<number> {
   const [first, ...rest] = argv;
 
   if (first === undefined || HELP_FLAGS.has(first)) {
@@ -80,6 +96,19 @@ export async function runCli(argv: string[], output: Output): Promise<number> {
     return 0;
   }
 
+  // Started now, so it runs alongside the command rather than after it.
+  const newerVersion = deps.checkForUpdate(command.name);
+  const code = await runCommand(command, rest, output);
+  const latest = await newerVersion;
+  if (latest !== null) {
+    output.err("");
+    output.err(updateNotice(VERSION, latest));
+  }
+  return code;
+}
+
+/** Runs one command, turning a crash into exit code 2 and a bug report. */
+async function runCommand(command: Command, rest: string[], output: Output): Promise<number> {
   try {
     return await command.run(rest, output);
   } catch (error) {

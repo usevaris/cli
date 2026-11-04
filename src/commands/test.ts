@@ -5,7 +5,8 @@
 // The failures that make a real call fail, and so refund its charge:
 //   - an output that doesn't match the service's output schema, which the
 //     gateway treats as the provider not delivering;
-//   - an endpoint that errors, redirects, times out, or answers without JSON.
+//   - an endpoint that errors, redirects, times out, or answers without JSON;
+//   - an output larger than the 4 MB of JSON Varis can deliver.
 // It also proves the handler's verifyRequest is wired correctly, because the
 // request is signed and checked the same way a real one is.
 //
@@ -29,8 +30,15 @@
 //      checks that signature against. src/lib/test-signing.ts explains how,
 //      and why that's safe.
 //   6. Sends it, with the gateway's 30-second timeout and no redirects.
-//   7. Validates the response against the output schema, and prints the
-//      output, or exactly what would make a real call fail.
+//   7. Judges the answer as the gateway does (src/lib/test-outcome.ts):
+//      validates it against the output schema, and prints the output, or
+//      exactly what would make a real call fail.
+//   8. For a call the server accepts, by answering 202 started or by sending
+//      a started notification before it answers (D26), waits for the result
+//      by notification. It prints each notification, judges each as Varis
+//      would (src/lib/test-notifications.ts), and validates the result as in
+//      step 7. There's no time limit, but as in production, 5 minutes without
+//      a notification fails the call.
 //
 // It reads varis.json as it is and doesn't run varis build first, so a test
 // is instant. After changing a definition, run varis build, then test.
@@ -49,20 +57,39 @@ import { toQueryString } from "../lib/query-string.ts";
 import { type SchemaProblem, validate } from "../lib/schema.ts";
 import { bold, dim, failure, success, yellow } from "../lib/style.ts";
 import {
+  createNotificationInbox,
+  type NotificationInbox,
+  type ReceivedNotification,
+} from "../lib/test-notifications.ts";
+import {
+  checkResult,
+  type FailureCause,
+  judgeAnswer,
+  judgeError,
+  keepsRunningOnceAccepted,
+  MAX_OUTPUT_BYTES,
+  type Outcome,
+  PROVIDER_TIMEOUT_MS,
+} from "../lib/test-outcome.ts";
+import {
   createTestSigner,
   LISTENER_HOST,
   LISTENER_PORT,
   type ListenResult,
-  listenForKeyRequests,
+  openTestListener,
+  type TestListener,
   type TestSigner,
 } from "../lib/test-signing.ts";
 import { VERSION } from "../lib/version.ts";
 
-/** The gateway gives a provider this long to answer, so the test does too. */
-const TIMEOUT_MS = 30_000;
-
 /** A response body is shown up to this many characters, then cut. */
 const MAX_SHOWN_BODY = 2_000;
+
+/**
+ * Varis fails an accepted call that sends no notification for this long, as
+ * provider_stopped_reporting (D3). The SDK sends one every 30 seconds.
+ */
+const SILENCE_LIMIT_MS = 300_000;
 
 /**
  * Everything the command reaches outside itself. The tests swap these to run
@@ -72,17 +99,23 @@ export type TestDeps = {
   cwd: string;
   fetch: typeof fetch;
   createSigner: () => TestSigner;
-  listen: (signer: TestSigner) => Promise<ListenResult>;
-  /** Milliseconds, for the timing in the success line. */
+  listen: (signer: TestSigner, inbox: NotificationInbox) => Promise<ListenResult>;
+  /** Milliseconds, for timings and the silence limit. */
   now: () => number;
+  /** Calls `callback` once a minute until the returned function is called. */
+  everyMinute: (callback: () => void) => () => void;
 };
 
 const defaultDeps = (): TestDeps => ({
   cwd: process.cwd(),
   fetch,
   createSigner: createTestSigner,
-  listen: (signer) => listenForKeyRequests(signer),
+  listen: (signer, inbox) => openTestListener(signer, inbox),
   now: () => Date.now(),
+  everyMinute: (callback) => {
+    const timer = setInterval(callback, 60_000);
+    return () => clearInterval(timer);
+  },
 });
 
 /**
@@ -127,6 +160,19 @@ function parseCommandArgs(args: string[]): Args | { error: string } {
   }
 }
 
+/**
+ * A service from varis.json, ready to call on the developer's server: the
+ * request exactly as the gateway would send it.
+ */
+type TestCall = {
+  slug: string;
+  service: ManifestService;
+  method: "GET" | "POST";
+  target: URL;
+  /** The exact body bytes, both signed and sent. Empty for GET. */
+  rawBody: string;
+};
+
 export async function runTest(
   args: string[],
   output: Output,
@@ -138,15 +184,67 @@ export async function runTest(
     return 2;
   }
 
-  // 1. The service, and where the developer's server runs.
-  const found = await readManifest(deps.cwd);
+  const call = await prepareTestCall(parsed, deps.cwd, output);
+  if (call === undefined) return 1;
+
+  // 5. A key for this one request, and the listener that vouches for it
+  // and takes its notifications.
+  const signer = deps.createSigner();
+  const inbox = createNotificationInbox((result) =>
+    checkResult(result, call.service.output_schema)
+  );
+  const listening = await deps.listen(signer, inbox);
+  if (!listening.ok) {
+    output.err(failure(output, listening.message));
+    return 1;
+  }
+
+  // The listener stays open for the whole run, because the server fetches
+  // the key while handling the request. It closes in `finally`, whatever
+  // happens, so the port is free for the next test and the process can exit.
+  try {
+    return await runTestCall(call, signer, listening.listener, inbox, output, deps);
+  } finally {
+    await listening.listener.close();
+  }
+}
+
+/**
+ * Steps 1 to 4: the service, its test URL, and its input, checked and built
+ * into the request. Undefined after saying what's wrong; nothing is sent.
+ */
+async function prepareTestCall(
+  parsed: Args,
+  cwd: string,
+  output: Output,
+): Promise<TestCall | undefined> {
+  const found = await readTestService(parsed.slug, cwd, output);
+  if (found === undefined) return undefined;
+
+  const input = await readInput(parsed, found.service, cwd, output);
+  if (input === undefined) return undefined;
+  if (!checkInput(parsed.slug, found.service, input, output)) return undefined;
+
+  return buildTestCall(parsed.slug, found.service, found.target, input, output);
+}
+
+/**
+ * Steps 1 and 2: the service from varis.json, and the URL a test sends it
+ * to on the developer's server.
+ */
+async function readTestService(
+  slug: string,
+  cwd: string,
+  output: Output,
+): Promise<{ service: ManifestService; target: URL } | undefined> {
+  const found = await readManifest(cwd);
   if (found.status === "missing") {
     output.err(failure(output, `No ${MANIFEST_FILE} in this folder. Run varis init first.`));
-    return 1;
+    return undefined;
   }
   if (found.status === "invalid") {
     output.err(failure(output, `${MANIFEST_FILE} can't be read: ${found.reason}.`));
-    return 1;
+    return undefined;
   }
   const manifest = found.manifest;
 
@@ -157,111 +255,327 @@ export async function runTest(
     );
     output.err("");
     output.err("  varis init --test-base-url http://localhost:3000");
-    return 1;
+    return undefined;
   }
 
   const services = (manifest.services ?? []) as ManifestService[];
-  const service = services.find((s) => s?.slug === parsed.slug);
+  const service = services.find((s) => s?.slug === slug);
   if (!service) {
     output.err(
       failure(
         output,
-        `${MANIFEST_FILE} has no service with the slug ${parsed.slug}. If you just defined it, run varis build.`,
+        `${MANIFEST_FILE} has no service with the slug ${slug}. If you just defined it, run varis build.`,
       ),
     );
-    return 1;
+    return undefined;
   }
 
-  // 2. The URL. endpoint_url is where the service runs in production; a test
-  // goes to the developer's server instead, by swapping base_url for
-  // test_base_url (testUrlFor explains the fallback). endpoint_url never
-  // carries a query string: publish forbids one, because the gateway owns the
-  // query of a GET service.
-  let target: URL;
+  // endpoint_url is where the service runs in production; a test goes to
+  // the developer's server instead, by swapping base_url for test_base_url
+  // (testUrlFor explains the fallback). endpoint_url never carries a query
+  // string: publish forbids one, because the gateway owns the query of a
+  // GET service.
   try {
-    target = testUrlFor(
+    const target = testUrlFor(
       String(service.endpoint_url),
       typeof manifest.base_url === "string" ? manifest.base_url : undefined,
       manifest.test_base_url,
     );
+    return { service, target };
   } catch {
     output.err(
       failure(
         output,
-        `Can't build a test URL from ${parsed.slug}'s endpoint_url and test_base_url. Check both in ${MANIFEST_FILE}.`,
+        `Can't build a test URL from ${slug}'s endpoint_url and test_base_url. Check both in ${MANIFEST_FILE}.`,
       ),
     );
-    return 1;
+    return undefined;
   }
+}
 
-  // 3. The input, checked before anything is sent, as the gateway checks it.
-  const input = await readInput(parsed, service, deps.cwd, output);
-  if (input === undefined) return 1;
-
+/** Step 3: the input, checked before anything is sent, as the gateway checks it. */
+function checkInput(
+  slug: string,
+  service: ManifestService,
+  input: unknown,
+  output: Output,
+): boolean {
   const inputCheck = validate(service.input_schema ?? {}, input);
-  if (!inputCheck.ok) {
-    if ("invalidSchema" in inputCheck) {
-      output.err(
-        failure(output, `${parsed.slug}'s input schema is invalid: ${inputCheck.invalidSchema}`),
-      );
-    } else {
-      output.err(
-        failure(output, `The input doesn't match ${parsed.slug}'s input schema, so nothing was sent.`),
-      );
-      printProblems(inputCheck.problems, output);
-    }
-    return 1;
-  }
+  if (inputCheck.ok) return true;
 
-  // 4. The request, built exactly as the gateway builds it. varis.json
-  // writes GET or POST; anything else is treated as the API's default, GET.
-  const method = service.method === "POST" ? "POST" : "GET";
-  let rawBody = "";
-  if (method === "GET") {
-    try {
-      target.search = toQueryString(input, service.input_schema);
-    } catch (error) {
-      output.err(
-        failure(
-          output,
-          `${parsed.slug} is a GET service, so its input must fit in a query string: ${
-            error instanceof Error ? error.message : String(error)
-          }.`,
-        ),
-      );
-      return 1;
-    }
+  if ("invalidSchema" in inputCheck) {
+    output.err(
+      failure(output, `${slug}'s input schema is invalid: ${inputCheck.invalidSchema}`),
+    );
   } else {
+    output.err(
+      failure(output, `The input doesn't match ${slug}'s input schema, so nothing was sent.`),
+    );
+    printProblems(inputCheck.problems, output);
+  }
+  return false;
+}
+
+/**
+ * Step 4: the request, built exactly as the gateway builds it. varis.json
+ * writes GET or POST; anything else is treated as the API's default, GET.
+ */
+function buildTestCall(
+  slug: string,
+  service: ManifestService,
+  target: URL,
+  input: unknown,
+  output: Output,
+): TestCall | undefined {
+  const method = service.method === "POST" ? "POST" : "GET";
+  if (method === "POST") {
     // Serialised once. These exact bytes are both signed and sent: sending a
     // second serialisation could differ, and the signature would fail.
-    rawBody = JSON.stringify(input);
+    return { slug, service, method, target, rawBody: JSON.stringify(input) };
   }
 
-  // 5. A key for this one request, and the listener that vouches for it.
-  const signer = deps.createSigner();
-  const listening = await deps.listen(signer);
-  if (!listening.ok) {
-    output.err(failure(output, listening.message));
+  try {
+    target.search = toQueryString(input, service.input_schema);
+  } catch (error) {
+    output.err(
+      failure(
+        output,
+        `${slug} is a GET service, so its input must fit in a query string: ${
+          error instanceof Error ? error.message : String(error)
+        }.`,
+      ),
+    );
+    return undefined;
+  }
+  return { slug, service, method, target, rawBody: "" };
+}
+
+/**
+ * Steps 6 to 8: sends the call, judges the answer as the gateway would, and
+ * for a call the server accepted, waits for its result by notification.
+ */
+async function runTestCall(
+  call: TestCall,
+  signer: TestSigner,
+  listener: TestListener,
+  inbox: NotificationInbox,
+  output: Output,
+  deps: TestDeps,
+): Promise<number> {
+  output.err(`${bold(output, call.method)} ${call.target.href}`);
+  output.err(dim(output, `Request ID ${signer.requestId}`));
+  output.err(dim(output, `Invocation ID ${signer.invocationId}`));
+
+  const startedAt = deps.now();
+  const outcome = await sendTestCall(call, signer, deps.fetch);
+  const elapsed = deps.now() - startedAt;
+
+  if (outcome.status === "started") {
+    inbox.markAccepted();
+    output.err(`Your server acknowledged the call with 202 started in ${elapsed} ms.`);
+    if (outcome.etaSeconds !== null || outcome.message !== null) {
+      output.err(`  ${describeProgress({ progressPercent: null, ...outcome })}`);
+    }
+    return await waitForResult(call, inbox, startedAt, output, deps);
+  }
+
+  // A started notification came before this answer, so the answer isn't
+  // the result (D26): the call goes on, unless the answer failed it.
+  if (inbox.accepted() && keepsRunningOnceAccepted(outcome)) {
+    output.err(
+      "Your server acknowledged the call with a started notification. Varis ignores its answer after that, so the call goes on.",
+    );
+    return await waitForResult(call, inbox, startedAt, output, deps);
+  }
+
+  if (outcome.status === "failed") {
+    return reportFailure(call, outcome.cause, listener.fetches(), output);
+  }
+  return reportSuccess(call, outcome.statusCode, outcome.payload, elapsed, output);
+}
+
+/**
+ * Step 8: prints each notification until one ends the call, then reports
+ * how it ended. There's no time limit: the developer stops it with Ctrl+C.
+ * As in production, an accepted call that goes 5 minutes without a
+ * notification fails; Varis checks once a minute, and so does the test.
+ */
+async function waitForResult(
+  call: TestCall,
+  inbox: NotificationInbox,
+  startedAt: number,
+  output: Output,
+  deps: TestDeps,
+): Promise<number> {
+  output.err("Waiting for its result by notification. Press Ctrl+C to stop.");
+  let lastHeardAt = deps.now();
+
+  let reportSilence!: () => void;
+  let silent = false;
+  const silenced = new Promise<number>((resolve) => {
+    reportSilence = () => resolve(reportStoppedReporting(output));
+  });
+  const stopReminders = deps.everyMinute(() => {
+    if (silent) return;
+    const now = deps.now();
+    if (now - lastHeardAt >= SILENCE_LIMIT_MS) {
+      silent = true;
+      reportSilence();
+    } else {
+      output.status(`Still waiting after ${formatDuration(now - startedAt)}. Press Ctrl+C to stop.`);
+    }
+  });
+
+  try {
+    for (;;) {
+      const notification = await Promise.race([inbox.next(), silenced]);
+      if (typeof notification === "number") return notification;
+
+      // Only a notification Varis records counts as hearing from the server.
+      if (notification.status === "started" || notification.status === "running") {
+        lastHeardAt = deps.now();
+      }
+      const code = reportNotification(call, notification, deps.now() - startedAt, output);
+      if (code !== undefined) return code;
+    }
+  } finally {
+    stopReminders();
+  }
+}
+
+/**
+ * Prints one notification. Returns the exit code when it ended the call, or
+ * undefined while the call goes on.
+ */
+function reportNotification(
+  call: TestCall,
+  notification: ReceivedNotification,
+  elapsed: number,
+  output: Output,
+): number | undefined {
+  const at = dim(output, formatDuration(elapsed).padStart(8));
+  switch (notification.status) {
+    case "started":
+      output.err(`${at}  Started.${withDetails({ progressPercent: null, ...notification })}`);
+      return undefined;
+    case "running":
+      output.err(`${at}  Running.${withDetails(notification)}`);
+      return undefined;
+    case "notice":
+      output.err(yellow(output, `${at}  Varis would drop part of a notification from your server:`));
+      printProblems(notification.notices, output);
+      return undefined;
+    case "invalid":
+      output.err(
+        yellow(output, `${at}  Varis would refuse a notification from your server with 400, and the call would go on:`),
+      );
+      printProblems(notification.problems, output);
+      return undefined;
+    case "unauthorised":
+      output.err(
+        yellow(
+          output,
+          `${at}  Varis would refuse a notification from your server with 401. Send it with Authorization: Bearer and the X-Varis-Notification-Token header's value, for the invocation in X-Varis-Invocation-Id.`,
+        ),
+      );
+      return undefined;
+    case "completed":
+      if (notification.check.ok) {
+        return reportLongSuccess(call, notification.result, elapsed, output);
+      }
+      // A result is judged as a sync output is, so it fails the same way.
+      return reportFailure(call, notification.check.cause, 0, output);
+    case "failed":
+      return reportFailedNotification(notification, output);
+  }
+}
+
+/** A `failed` notification ended the call. */
+function reportFailedNotification(
+  notification: Extract<ReceivedNotification, { status: "failed" }>,
+  output: Output,
+): number {
+  if (notification.reason === "output_too_large") {
+    output.err(
+      failure(
+        output,
+        `Your server reported that its result is larger than ${formatMegabytes(MAX_OUTPUT_BYTES)} of JSON. Varis would fail this call as output_too_large and refund it.`,
+      ),
+    );
+    output.err("Return a large result as a URL to your own storage instead.");
     return 1;
   }
-  const { listener } = listening;
+  output.err(
+    failure(output, "Your server reported that the call failed. Varis would count this as a failed call and refund it."),
+  );
+  if (notification.message !== null) output.err(`Its message: ${notification.message}`);
+  return 1;
+}
 
-  output.err(`${bold(output, method)} ${target.href}`);
-  output.err(dim(output, `Request ID ${signer.requestId}`));
+/** No notification for 5 minutes: Varis would have given up on the call. */
+function reportStoppedReporting(output: Output): number {
+  output.err(
+    failure(
+      output,
+      `Your server sent no notification for ${SILENCE_LIMIT_MS / 60_000} minutes. Varis would fail this call as provider_stopped_reporting and refund it.`,
+    ),
+  );
+  output.err(
+    "Send a running notification at least every 5 minutes while the work runs. @usevaris/sdk sends one every 30 seconds.",
+  );
+  return 1;
+}
 
-  // 6. Send it. The listener stays open until the whole response has
-  // arrived, because the server fetches the key while handling the request.
-  // It closes in `finally`, whatever happens, so the port is free for the
-  // next test and the process can exit.
-  const started = deps.now();
-  let response: Response;
-  let text: string;
-  let keyFetches: number;
+type Progress = {
+  progressPercent: number | null;
+  etaSeconds: number | null;
+  message: string | null;
+};
+
+/** "40%, about 10 min left. Rendering frame 400", or "" when there's nothing to say. */
+function describeProgress(progress: Progress): string {
+  const parts: string[] = [];
+  if (progress.progressPercent !== null) parts.push(`${progress.progressPercent}%`);
+  if (progress.etaSeconds !== null) {
+    parts.push(`about ${formatDuration(progress.etaSeconds * 1000)} left`);
+  }
+  const figures = parts.join(", ");
+  if (progress.message === null) return figures === "" ? "" : `${figures}.`;
+  return figures === "" ? progress.message : `${figures}. ${progress.message}`;
+}
+
+/** The progress after a space, ready to follow "Running.", or "". */
+function withDetails(progress: Progress): string {
+  const details = describeProgress(progress);
+  return details === "" ? "" : ` ${details}`;
+}
+
+/** A duration such as "45 s", "3 min 5 s", or "2 h 10 min". */
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return seconds % 60 === 0 ? `${minutes} min` : `${minutes} min ${seconds % 60} s`;
+  const hours = Math.floor(minutes / 60);
+  return minutes % 60 === 0 ? `${hours} h` : `${hours} h ${minutes % 60} min`;
+}
+
+/**
+ * Signs and sends the call, with the gateway's 30-second timeout and no
+ * redirects, and judges what comes back.
+ */
+async function sendTestCall(
+  call: TestCall,
+  signer: TestSigner,
+  fetcher: typeof fetch,
+): Promise<Outcome> {
+  const { method, target, rawBody } = call;
   try {
-    response = await deps.fetch(target.href, {
+    const response = await fetcher(target.href, {
       method,
       headers: {
         ...signer.sign({
+          invocationId: signer.invocationId,
           method,
           // Signed exactly as the URL goes out: URL serialises the path and
           // query the same way the gateway does.
@@ -270,6 +584,10 @@ export async function runTest(
         }),
         Accept: "application/json",
         "User-Agent": `varis-cli/${VERSION} (varis test)`,
+        "X-Varis-Invocation-Id": signer.invocationId,
+        // Not signed, as the gateway sends it. The SDK sends notifications
+        // for this call back to the listener with it.
+        "X-Varis-Notification-Token": signer.notificationToken,
         // The gateway sends Content-Type only with a body. So does the test,
         // so a handler that trips over it fails here, not in production.
         ...(method === "POST" && { "Content-Type": "application/json" }),
@@ -279,62 +597,115 @@ export async function runTest(
       // signed request somewhere the provider never meant. A service that
       // redirects fails in production, so it fails here too.
       redirect: "manual",
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
     });
-    text = await response.text();
+    const text = await response.text();
+    return judgeAnswer(response, text, call.service.output_schema);
   } catch (error) {
-    return reportUnreachable(error, target, listener.fetches(), output);
-  } finally {
-    keyFetches = listener.fetches();
-    await listener.close();
+    return judgeError(error);
   }
-  const elapsed = deps.now() - started;
+}
 
-  // 7. Judge the response the way the gateway would.
-  if (response.status < 200 || response.status >= 300) {
-    return reportStatus(response, text, keyFetches, output);
-  }
-
-  let payload: unknown;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    output.err(
-      failure(
-        output,
-        `Your server answered ${response.status}, but not with JSON. Varis would count this as a failed call and refund it.`,
-      ),
-    );
-    showBody(text, output);
-    return 1;
-  }
-
-  const outputCheck = validate(service.output_schema ?? {}, payload);
-  if (!outputCheck.ok) {
-    if ("invalidSchema" in outputCheck) {
-      output.err(
-        failure(output, `${parsed.slug}'s output schema is invalid: ${outputCheck.invalidSchema}`),
-      );
-      return 1;
-    }
-    output.err(
-      failure(
-        output,
-        `The response doesn't match ${parsed.slug}'s output schema. Varis would count this as a failed call and refund it.`,
-      ),
-    );
-    printProblems(outputCheck.problems, output);
-    showBody(JSON.stringify(payload, null, 2), output);
-    return 1;
-  }
-
+/** The output matched its schema: the call passed. */
+function reportSuccess(
+  call: TestCall,
+  statusCode: number,
+  payload: unknown,
+  elapsed: number,
+  output: Output,
+): number {
   output.err(
-    success(output, `${parsed.slug} passed: ${response.status} in ${elapsed} ms, and the output matches its schema.`),
+    success(output, `${call.slug} passed: ${statusCode} in ${elapsed} ms, and the output matches its schema.`),
   );
   // Messages go to stderr and the output alone to stdout, so
   // `varis test weather | jq .temp_c` works.
   output.out(JSON.stringify(payload, null, 2));
   return 0;
+}
+
+/** A result came by notification and matched its schema: the call passed. */
+function reportLongSuccess(
+  call: TestCall,
+  result: unknown,
+  elapsed: number,
+  output: Output,
+): number {
+  output.err(
+    success(
+      output,
+      `${call.slug} passed: its result came by notification after ${formatDuration(elapsed)}, and it matches the output schema.`,
+    ),
+  );
+  output.out(JSON.stringify(result, null, 2));
+  return 0;
+}
+
+/** Says what would make a real call fail, and how to fix it. */
+function reportFailure(
+  call: TestCall,
+  cause: FailureCause,
+  keyFetches: number,
+  output: Output,
+): number {
+  switch (cause.kind) {
+    case "no_answer":
+      output.err(
+        failure(
+          output,
+          `Your server didn't answer within ${PROVIDER_TIMEOUT_MS / 1000} seconds. Varis would count this as a timeout and refund the call.`,
+        ),
+      );
+      return 1;
+    case "unreachable":
+      return reportUnreachable(call.target, keyFetches, output);
+    case "status":
+      return reportStatus(cause.response, cause.text, keyFetches, output);
+    case "not_started":
+      output.err(
+        failure(
+          output,
+          `Your server answered 202, but not with {"status":"started"}. Varis would count this as a failed call and refund it.`,
+        ),
+      );
+      output.err(
+        `To finish later, answer 202 with exactly that body, then send the result by notification. @usevaris/sdk does both.`,
+      );
+      if (cause.text.trim() !== "") showBody(cause.text, output);
+      return 1;
+    case "too_large":
+      output.err(
+        failure(
+          output,
+          `Your server's output is ${formatMegabytes(cause.bytes)} of JSON. Varis delivers at most ${formatMegabytes(MAX_OUTPUT_BYTES)}, so it would fail this call as output_too_large and refund it.`,
+        ),
+      );
+      output.err("Return a large result as a URL to your own storage instead.");
+      return 1;
+    case "not_json":
+      output.err(
+        failure(
+          output,
+          `Your server answered ${cause.statusCode}, but not with JSON. Varis would count this as a failed call and refund it.`,
+        ),
+      );
+      showBody(cause.text, output);
+      return 1;
+    case "invalid_schema":
+      output.err(
+        failure(output, `${call.slug}'s output schema is invalid: ${cause.message}`),
+      );
+      return 1;
+    case "schema_mismatch":
+      output.err(
+        failure(
+          output,
+          `The response doesn't match ${call.slug}'s output schema. Varis would count this as a failed call and refund it.`,
+        ),
+      );
+      printProblems(cause.problems, output);
+      showBody(JSON.stringify(cause.payload, null, 2), output);
+      return 1;
+  }
 }
 
 /**
@@ -392,23 +763,12 @@ function exampleInput(required: unknown[]): string {
   return JSON.stringify(Object.fromEntries(required.map((key) => [String(key), "…"])));
 }
 
-/** fetch threw: the server is down, unreachable, or too slow. */
+/** The connection failed: the server is down or unreachable. */
 function reportUnreachable(
-  error: unknown,
   target: URL,
   keyFetches: number,
   output: Output,
 ): number {
-  const name = (error as { name?: unknown } | null)?.name;
-  if (name === "TimeoutError" || name === "AbortError") {
-    output.err(
-      failure(
-        output,
-        `Your server didn't answer within ${TIMEOUT_MS / 1000} seconds. Varis would count this as a timeout and refund the call.`,
-      ),
-    );
-    return 1;
-  }
   output.err(
     failure(
       output,
@@ -467,10 +827,15 @@ function reportStatus(
       );
     } else {
       // The key was fetched, so the signature was checked and didn't match:
-      // the request changed between the wire and verifyRequest.
+      // the SDK predates the invocation ID in the signed string, or the
+      // request changed between the wire and verifyRequest.
       output.err(
         yellow(output, "Your server fetched the test key, but the signature didn't match. Usually one of:"),
       );
+      output.err(
+        "  - your server uses @usevaris/sdk older than 1.2.0, which doesn't check the invocation ID Varis signs.",
+      );
+      output.err("    Upgrade it: npm install @usevaris/sdk@latest");
       output.err("  - middleware rewrote the path or query before verifyRequest saw it;");
       output.err("  - the body was read or parsed before calling verifyRequest.");
       output.err("verifyRequest must see the request exactly as it arrived.");
@@ -479,6 +844,12 @@ function reportStatus(
 
   if (text.trim() !== "") showBody(text, output);
   return 1;
+}
+
+/** Bytes as megabytes, for example "4.2 MB". */
+function formatMegabytes(bytes: number): string {
+  const megabytes = bytes / (1024 * 1024);
+  return `${Number.isInteger(megabytes) ? megabytes : megabytes.toFixed(1)} MB`;
 }
 
 function printProblems(problems: SchemaProblem[], output: Output): void {
@@ -507,6 +878,11 @@ export const test: Command = {
 
   Set test_base_url once, for example:
     varis init --test-base-url http://localhost:3000
+
+  If your server accepts the call to finish later, by answering 202 with
+  {"status":"started"} or by sending a started notification first, varis
+  test waits for the result by notification, as Varis would. It prints
+  each notification, then checks the result. Press Ctrl+C to stop waiting.
 
   It reads varis.json as it is. After changing a service, run varis build
   first.

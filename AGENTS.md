@@ -30,12 +30,18 @@ varis-cli/
 ├── src/lib/base-url.ts   The publish rules for varis.json's base_url.
 ├── src/lib/agent-instructions.ts  The AGENTS.md block and CLAUDE.md import.
 ├── src/lib/generator.ts  Language markers, running a generator, reading its contract.
-├── src/lib/test-signing.ts  varis test's throwaway signing key and loopback key
-│                         listener. Must match the SDK's constants.
+├── src/lib/test-signing.ts  varis test's throwaway signing key and loopback
+│                         listener, for the key and the call's notifications.
+│                         Must match the SDK's constants.
+├── src/lib/test-outcome.ts  What the gateway makes of a provider's answer.
+│                         Mirrors callProvider in the varis repository.
+├── src/lib/test-notifications.ts  A test call's notifications and Varis's
+│                         answers. Mirrors the notification route.
 ├── src/lib/query-string.ts  GET input as a query string, exactly as the gateway.
 ├── src/lib/schema.ts     JSON Schema validation, configured like the gateway.
 ├── src/lib/install-channel.ts  How this copy was installed: Homebrew, Scoop, script.
 ├── src/lib/release.ts    Finds, downloads, and checks a release, for varis upgrade.
+├── src/lib/update-check.ts  The once-a-day "A newer varis is available" notice.
 ├── src/lib/uninstall.ts  Undoes an install, for varis dracarys.
 ├── src/lib/version.ts    The version.
 ├── install.sh            Installer for macOS and Linux (POSIX sh, not bash).

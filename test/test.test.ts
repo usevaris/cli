@@ -13,13 +13,17 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runTest, type TestDeps } from "../src/commands/test.ts";
 import type { Output } from "../src/lib/output.ts";
+import { createNotificationInbox, type NotificationInbox } from "../src/lib/test-notifications.ts";
 import {
   createTestSigner,
+  LISTENER_NOTIFICATIONS_PATH,
   LISTENER_PATH,
-  listenForKeyRequests,
+  openTestListener,
   signedString,
   TEST_KEY_ID,
   TEST_REQUEST_ID_PREFIX,
+  type TestListener,
+  type TestSigner,
 } from "../src/lib/test-signing.ts";
 
 const WEATHER = {
@@ -65,20 +69,35 @@ async function freePort(): Promise<number> {
 
 type Seen = { method: string; url: string; headers: IncomingMessage["headers"]; body: string };
 
+type Answer = { status: number; body: unknown; headers?: Record<string, string> };
+
 /**
  * What the provider's handler does with a verified request. Returns the
  * status and JSON body to answer with.
  */
-type Handler = (seen: Seen) => { status: number; body: unknown; headers?: Record<string, string> };
+type Handler = (seen: Seen) => Answer | Promise<Answer>;
 
 /**
- * A provider server. With `verifies`, it checks each request as the SDK
- * does: the test key ID must come with a test request ID, the public key is
- * fetched from the listener for that request ID, and the signature must
- * cover the timestamp, method, path and query, and body. A request that
- * fails gets a 401, as a handler calling verifyRequest would send.
+ * How the provider's SDK checks a signature: `current` is SDK 1.2.0 and
+ * later, over D18's string with the invocation ID; `old` is SDK 1.1.0 and
+ * earlier, without it.
  */
-function provider(keyPort: number, handler: Handler, verifies = true) {
+type Verifier = "current" | "old" | false;
+
+/**
+ * A provider server. Unless `verifies` is false, it checks each request as
+ * the SDK does: the test key ID must come with a test request ID, the public
+ * key is fetched from the listener for that request ID, and the signature
+ * must cover the timestamp, invocation ID, method, path and query, and body.
+ * A request that fails gets a 401, as a handler calling verifyRequest would
+ * send. `after` runs once the handler's answer is sent, as the SDK's work
+ * goes on after a 202.
+ */
+function provider(
+  keyPort: number,
+  handler: Handler,
+  { verifies = "current", after }: { verifies?: Verifier; after?: (seen: Seen) => Promise<void> } = {},
+) {
   const seen: Seen[] = [];
   const server: Server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -91,21 +110,26 @@ function provider(keyPort: number, handler: Handler, verifies = true) {
     };
     seen.push(current);
 
-    if (verifies && !(await verifies_(current, keyPort))) {
+    if (verifies && !(await verifies_(current, keyPort, verifies))) {
       response.writeHead(401, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: "unauthorised" }));
       return;
     }
 
-    const answer = handler(current);
+    const answer = await handler(current);
     response.writeHead(answer.status, { "Content-Type": "application/json", ...answer.headers });
     response.end(typeof answer.body === "string" ? answer.body : JSON.stringify(answer.body));
+    if (after) void after(current);
   });
   return { server, seen };
 }
 
-/** The SDK's verifyRequest, cut down to the test-key path. */
-async function verifies_(seen: Seen, keyPort: number): Promise<boolean> {
+/**
+ * The SDK's verifyRequest, cut down to the test-key path. The signed string
+ * is written out here rather than taken from signedString, so a change to
+ * either shows up as a failing test.
+ */
+async function verifies_(seen: Seen, keyPort: number, verifier: "current" | "old"): Promise<boolean> {
   const keyId = seen.headers["x-varis-key-id"];
   const requestId = String(seen.headers["x-varis-request-id"] ?? "");
   if (keyId !== TEST_KEY_ID || !requestId.startsWith(TEST_REQUEST_ID_PREFIX)) return false;
@@ -117,11 +141,11 @@ async function verifies_(seen: Seen, keyPort: number): Promise<boolean> {
   const key = (await answer.json()) as { kid: string; public_key_pem: string };
   if (key.kid !== TEST_KEY_ID) return false;
 
-  const message = signedString(String(seen.headers["x-varis-timestamp"]), {
-    method: seen.method as "GET" | "POST",
-    pathAndQuery: seen.url,
-    rawBody: seen.body,
-  });
+  const timestamp = String(seen.headers["x-varis-timestamp"]);
+  const invocationId = String(seen.headers["x-varis-invocation-id"]);
+  const message = verifier === "current"
+    ? `${timestamp}.${invocationId}.${seen.method}.${seen.url}.${seen.body}`
+    : `${timestamp}.${seen.method}.${seen.url}.${seen.body}`;
   return verify(
     null,
     Buffer.from(message),
@@ -173,22 +197,71 @@ async function manifest(testBaseUrl: string | undefined, services: object[] = [W
 async function run(args: string[], overrides: Partial<TestDeps> = {}) {
   const out: string[] = [];
   const err: string[] = [];
+  const status: string[] = [];
   const output: Output = {
     out: (t) => out.push(t),
     err: (t) => err.push(t),
-    status: () => {},
+    status: (t) => status.push(t),
     styled: false,
   };
   const deps: TestDeps = {
     cwd: project,
     fetch,
     createSigner: createTestSigner,
-    listen: (signer) => listenForKeyRequests(signer, keyPort),
+    listen: (signer, inbox) => openTestListener(signer, inbox, keyPort),
     now: () => 0,
+    // Never fires unless a test asks it to.
+    everyMinute: () => () => {},
     ...overrides,
   };
   const code = await runTest(args, output, deps);
-  return { code, out: out.join("\n"), err: err.join("\n") };
+  return { code, out: out.join("\n"), err: err.join("\n"), status };
+}
+
+/**
+ * Sends a notification for the call `seen` received, as the SDK does: to the
+ * listener, with the call's own token. Returns the listener's answer.
+ */
+async function notify(seen: Seen, body: unknown): Promise<{ status: number; body: unknown }> {
+  const invocationId = String(seen.headers["x-varis-invocation-id"]);
+  const answer = await fetch(
+    `http://127.0.0.1:${keyPort}${LISTENER_NOTIFICATIONS_PATH}?invocation_id=${encodeURIComponent(invocationId)}`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${String(seen.headers["x-varis-notification-token"])}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    },
+  );
+  return { status: answer.status, body: await answer.json() };
+}
+
+/** A clock the test moves by hand, and an everyMinute that ticks it. */
+function manualClock() {
+  let now = 0;
+  let tick: (() => void) | undefined;
+  return {
+    now: () => now,
+    everyMinute: (callback: () => void) => {
+      tick = callback;
+      return () => {
+        tick = undefined;
+      };
+    },
+    /** Moves the clock on and fires the minute timer, if it's running. */
+    advance: (ms: number) => {
+      now += ms;
+      tick?.();
+    },
+    ticking: () => tick !== undefined,
+  };
+}
+
+/** Resolves once `condition` holds, checking every few milliseconds. */
+async function until(condition: () => boolean): Promise<void> {
+  while (!condition()) await new Promise((done) => setTimeout(done, 5));
 }
 
 describe("varis test", () => {
@@ -261,6 +334,21 @@ describe("varis test", () => {
     expect(result.err).toContain('"temp_c": "warm"');
   });
 
+  it("fails an output over 4 MB, as the gateway does, before checking its shape", async () => {
+    // Valid JSON matching the schema, but too large to deliver.
+    const big = JSON.stringify({ temp_c: 1, padding: "x".repeat(4 * 1024 * 1024) });
+    const p = provider(keyPort, () => ({ status: 200, body: big }));
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.out).toBe("");
+    expect(result.err).toContain("output_too_large");
+    expect(result.err).toContain("at most 4 MB");
+    expect(result.err).toContain("as a URL to your own storage");
+  });
+
   it("reports an answer that isn't JSON", async () => {
     const p = provider(keyPort, () => ({ status: 200, body: "<html>hi</html>" }));
     await manifest(await start(p));
@@ -300,7 +388,9 @@ describe("varis test", () => {
   it("explains a 401 when the server never fetched the key", async () => {
     // A server that rejects without asking: no verifyRequest, an old SDK,
     // or no way to reach this machine's loopback.
-    const p = provider(keyPort, () => ({ status: 401, body: { error: "unauthorised" } }), false);
+    const p = provider(keyPort, () => ({ status: 401, body: { error: "unauthorised" } }), {
+      verifies: false,
+    });
     await manifest(await start(p));
 
     const result = await run(["weather", "--input", '{"city":"Lagos"}']);
@@ -325,6 +415,36 @@ describe("varis test", () => {
 
     expect(result.code).toBe(1);
     expect(result.err).toContain("fetched the test key, but the signature didn't match");
+  });
+
+  it("fails a server on an SDK that signs without the invocation ID, and says to upgrade", async () => {
+    const p = provider(keyPort, () => ({ status: 200, body: { temp_c: 1 } }), {
+      verifies: "old",
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("fetched the test key, but the signature didn't match");
+    expect(result.err).toContain("older than 1.2.0");
+    expect(result.err).toContain("npm install @usevaris/sdk@latest");
+  });
+
+  it("sends the invocation ID and notification token, as the gateway does", async () => {
+    const p = provider(keyPort, () => ({ status: 200, body: { temp_c: 1 } }));
+    await manifest(await start(p));
+    const signer = createTestSigner();
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}'], {
+      createSigner: () => signer,
+    });
+
+    expect(result.code).toBe(0);
+    const headers = p.seen[0]!.headers;
+    expect(headers["x-varis-invocation-id"]).toBe(signer.invocationId);
+    expect(headers["x-varis-notification-token"]).toBe(signer.notificationToken);
+    expect(result.err).toContain(`Invocation ID ${signer.invocationId}`);
   });
 
   it("stops before sending an input that breaks the schema", async () => {
@@ -435,12 +555,362 @@ describe("varis test", () => {
   });
 });
 
-describe("the key listener", () => {
-  it("serves the key only for the request it signed", async () => {
+describe("varis test, for a call that finishes later", () => {
+  const STARTED = { status: 202, body: { status: "started" } };
+
+  it("waits after 202 started, prints progress, and passes a valid result", async () => {
+    const answers: unknown[] = [];
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        answers.push(
+          await notify(seen, { status: "running", progress_percent: 40, eta_seconds: 60, message: "Rendering" }),
+        );
+        answers.push(await notify(seen, { status: "completed", result: { temp_c: 18 } }));
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toEqual({ temp_c: 18 });
+    expect(result.err).toContain("acknowledged the call with 202 started");
+    expect(result.err).toContain("Running. 40%, about 1 min left. Rendering");
+    expect(result.err).toContain("weather passed: its result came by notification");
+    // The listener closes gracefully, so the answer that ended the call
+    // still reaches the server.
+    await until(() => answers.length === 2);
+    expect(answers).toEqual([
+      { status: 200, body: { continue: true } },
+      { status: 200, body: { continue: false } },
+    ]);
+  });
+
+  it("prints the ETA and message from a 202 started", async () => {
+    const p = provider(keyPort, () => ({
+      status: 202,
+      body: { status: "started", eta_seconds: 600, message: "Queued for rendering" },
+    }), {
+      after: async (seen) => {
+        await notify(seen, { status: "completed", result: { temp_c: 1 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(result.err).toContain("about 10 min left. Queued for rendering");
+  });
+
+  it("treats a started notification before the answer as accepting the call, and ignores the answer (D26)", async () => {
+    let started: unknown;
+    const p = provider(keyPort, async (seen) => {
+      started = await notify(seen, { status: "started" });
+      // What a route that hands work to a queue answers its own users.
+      return { status: 200, body: { queued: true } };
+    }, {
+      after: async (seen) => {
+        await notify(seen, { status: "completed", result: { temp_c: 9 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(started).toEqual({ status: 200, body: { continue: true } });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toEqual({ temp_c: 9 });
+    expect(result.out).not.toContain("queued");
+    expect(result.err).toContain("acknowledged the call with a started notification");
+  });
+
+  it("keeps a call running when a 504 follows a started notification, as the gateway does", async () => {
+    const p = provider(keyPort, async (seen) => {
+      await notify(seen, { status: "started" });
+      return { status: 504, body: {} };
+    }, {
+      after: async (seen) => {
+        await notify(seen, { status: "completed", result: { temp_c: 2 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+  });
+
+  it("fails a call whose answer is an error after a started notification, as the gateway refunds it", async () => {
+    const p = provider(keyPort, async (seen) => {
+      await notify(seen, { status: "started" });
+      return { status: 500, body: { error: "queue down" } };
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("answered 500");
+    expect(result.err).toContain("queue down");
+  });
+
+  it("ignores progress notifications on a call that answered without accepting", async () => {
+    const p = provider(keyPort, async (seen) => {
+      await notify(seen, { status: "running" });
+      return { status: 200, body: { temp_c: 4 } };
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toEqual({ temp_c: 4 });
+    expect(result.err).toContain("weather passed: 200");
+  });
+
+  it("fails a 202 without {\"status\":\"started\"}, as a provider_error", async () => {
+    const p = provider(keyPort, () => ({ status: 202, body: { accepted: true } }));
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain(`answered 202, but not with {"status":"started"}`);
+    expect(result.err).toContain('{"accepted":true}');
+  });
+
+  it("fails a result that breaks the output schema, and the server gets a 422", async () => {
+    let answer: unknown;
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        answer = await notify(seen, { status: "completed", result: { temp_c: "cold" } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.out).toBe("");
+    expect(result.err).toContain("doesn't match weather's output schema");
+    expect(result.err).toContain("/temp_c  must be number");
+    await until(() => answer !== undefined);
+    expect(answer).toMatchObject({ status: 422, body: { continue: false } });
+  });
+
+  it("fails a result over 4 MB as output_too_large, and the server gets a 413", async () => {
+    let answer: unknown;
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        answer = await notify(seen, {
+          status: "completed",
+          result: { temp_c: 1, padding: "x".repeat(4 * 1024 * 1024) },
+        });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("output_too_large");
+    await until(() => answer !== undefined);
+    expect(answer).toMatchObject({ status: 413, body: { continue: false } });
+  });
+
+  it("fails when the server reports the call failed, and shows its message", async () => {
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        await notify(seen, { status: "failed", message: "Out of GPU memory" });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("reported that the call failed");
+    expect(result.err).toContain("Its message: Out of GPU memory");
+  });
+
+  it("fails when the SDK reports its result too large to send", async () => {
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        await notify(seen, { status: "failed", reason: "output_too_large" });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("larger than 4 MB of JSON");
+    expect(result.err).toContain("output_too_large");
+  });
+
+  it("explains a notification Varis would refuse, and keeps waiting", async () => {
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        await notify(seen, { status: "running", progress_percent: 140 });
+        await notify({ ...seen, headers: { ...seen.headers, "x-varis-notification-token": "var_nt_wrong" } }, {
+          status: "running",
+        });
+        await notify(seen, { status: "completed", result: { temp_c: 3 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(result.err).toContain("refuse a notification from your server with 400");
+    expect(result.err).toContain("/progress_percent  must be a whole number from 0 to 100");
+    expect(result.err).toContain("refuse a notification from your server with 401");
+  });
+
+  it("warns about parts of a notification Varis would drop, and keeps the notification", async () => {
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        await notify(seen, { status: "running", etaSeconds: 60, message: "y".repeat(200) });
+        await notify(seen, { status: "completed", result: { temp_c: 3 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const result = await run(["weather", "--input", '{"city":"Lagos"}']);
+
+    expect(result.code).toBe(0);
+    expect(result.err).toContain("Varis would drop part of a notification from your server:");
+    expect(result.err).toContain("/etaSeconds  isn't a field Varis reads, so it's ignored. Did you mean eta_seconds?");
+    expect(result.err).toContain("/message  is 200 characters. Varis keeps the first 160");
+    expect(result.err).toContain(`Running. ${"y".repeat(160)}`);
+  });
+
+  it("reminds the developer every minute that it's still waiting", async () => {
+    const clock = manualClock();
+    let finish!: () => Promise<unknown>;
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        finish = () => notify(seen, { status: "completed", result: { temp_c: 5 } });
+      },
+    });
+    await manifest(await start(p));
+
+    const running = run(["weather", "--input", '{"city":"Lagos"}'], clock);
+    await until(() => clock.ticking() && finish !== undefined);
+    clock.advance(60_000);
+    clock.advance(60_000);
+    await finish();
+    const result = await running;
+
+    expect(result.code).toBe(0);
+    expect(result.status).toEqual([
+      "Still waiting after 1 min. Press Ctrl+C to stop.",
+      "Still waiting after 2 min. Press Ctrl+C to stop.",
+    ]);
+    expect(clock.ticking()).toBe(false);
+  });
+
+  it("fails a call that sends no notification for 5 minutes, as provider_stopped_reporting", async () => {
+    const clock = manualClock();
+    let heartbeat!: () => Promise<unknown>;
+    const p = provider(keyPort, () => STARTED, {
+      after: async (seen) => {
+        heartbeat = () => notify(seen, { status: "running" });
+      },
+    });
+    await manifest(await start(p));
+
+    const running = run(["weather", "--input", '{"city":"Lagos"}'], clock);
+    await until(() => clock.ticking() && heartbeat !== undefined);
+    // A heartbeat at 4 minutes restarts the 5 minutes.
+    clock.advance(240_000);
+    await heartbeat();
+    // Lets the command read the heartbeat before the clock moves again.
+    await new Promise((done) => setTimeout(done, 10));
+    clock.advance(240_000);
+    expect(clock.ticking()).toBe(true);
+    clock.advance(60_000);
+    const result = await running;
+
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("no notification for 5 minutes");
+    expect(result.err).toContain("provider_stopped_reporting");
+  });
+});
+
+describe("the test signer", () => {
+  it("makes test IDs and a test token that can't be mistaken for real ones", () => {
     const signer = createTestSigner();
-    const listening = await listenForKeyRequests(signer, keyPort);
+
+    expect(signer.requestId).toMatch(/^var_tst_req_[0-9a-f-]{36}$/);
+    expect(signer.invocationId).toMatch(/^var_tst_invk_[0-9a-f-]{36}$/);
+    expect(signer.notificationToken).toMatch(/^var_nt_test_[0-9a-f-]{36}$/);
+    expect(createTestSigner().invocationId).not.toBe(signer.invocationId);
+  });
+
+  it("signs D18's string: timestamp, invocation ID, method, path and query, body", () => {
+    const request = {
+      invocationId: "var_tst_invk_1",
+      method: "POST" as const,
+      pathAndQuery: "/v1/summarise?x=1",
+      rawBody: '{"text":"hi"}',
+    };
+    expect(signedString("1700000000", request)).toBe(
+      '1700000000.var_tst_invk_1.POST./v1/summarise?x=1.{"text":"hi"}',
+    );
+
+    const signer = createTestSigner();
+    const headers = signer.sign(request);
+    expect(
+      verify(
+        null,
+        Buffer.from(signedString(headers["X-Varis-Timestamp"]!, request)),
+        signer.publicKeyPem,
+        Buffer.from(headers["X-Varis-Signature"]!, "base64"),
+      ),
+    ).toBe(true);
+    expect(headers["X-Varis-Key-Id"]).toBe(TEST_KEY_ID);
+    expect(headers["X-Varis-Request-Id"]).toBe(signer.requestId);
+  });
+});
+
+describe("the test listener", () => {
+  const anyResult = () => ({ ok: true as const });
+
+  /** Opens a listener for a fresh signer, runs `body`, and always closes it. */
+  async function withListener(
+    body: (signer: TestSigner, inbox: NotificationInbox, listener: TestListener) => Promise<void>,
+  ) {
+    const signer = createTestSigner();
+    const inbox = createNotificationInbox(anyResult);
+    const listening = await openTestListener(signer, inbox, keyPort);
     if (!listening.ok) throw new Error(listening.message);
     try {
+      await body(signer, inbox, listening.listener);
+    } finally {
+      await listening.listener.close();
+    }
+  }
+
+  /** Sends a notification the way the SDK does. */
+  function notify(invocationId: string, token: string | undefined, body: unknown) {
+    return fetch(
+      `http://127.0.0.1:${keyPort}${LISTENER_NOTIFICATIONS_PATH}?invocation_id=${encodeURIComponent(invocationId)}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(token !== undefined && { authorization: `Bearer ${token}` }),
+        },
+        body: JSON.stringify(body),
+      },
+    );
+  }
+
+  it("serves the key only for the request it signed", async () => {
+    await withListener(async (signer, _inbox, listener) => {
       const base = `http://127.0.0.1:${keyPort}${LISTENER_PATH}`;
       const right = await fetch(`${base}?request_id=${signer.requestId}`);
       const wrong = await fetch(`${base}?request_id=${TEST_REQUEST_ID_PREFIX}other`);
@@ -450,9 +920,54 @@ describe("the key listener", () => {
       expect(await right.json()).toEqual({ kid: TEST_KEY_ID, public_key_pem: signer.publicKeyPem });
       expect(wrong.status).toBe(404);
       expect(elsewhere.status).toBe(404);
-      expect(listening.listener.fetches()).toBe(1);
-    } finally {
-      await listening.listener.close();
-    }
+      expect(listener.fetches()).toBe(1);
+    });
+  });
+
+  it("takes a notification with the token it issued, for its invocation", async () => {
+    await withListener(async (signer, inbox) => {
+      const answer = await notify(signer.invocationId, signer.notificationToken, {
+        status: "running",
+        message: "Rendering",
+      });
+
+      expect(answer.status).toBe(200);
+      expect(await answer.json()).toEqual({ continue: true });
+      expect(await inbox.next()).toEqual({
+        status: "running",
+        progressPercent: null,
+        etaSeconds: null,
+        message: "Rendering",
+      });
+    });
+  });
+
+  it("refuses a notification with a wrong or missing token, or for another invocation, with a 401", async () => {
+    await withListener(async (signer, inbox) => {
+      const answers = [
+        await notify(signer.invocationId, "var_nt_test_wrong", { status: "running" }),
+        await notify(signer.invocationId, undefined, { status: "running" }),
+        await notify("var_tst_invk_other", signer.notificationToken, { status: "running" }),
+      ];
+
+      for (const answer of answers) {
+        expect(answer.status).toBe(401);
+        expect(await answer.json()).toMatchObject({
+          continue: false,
+          error: { code: "unauthorized" },
+        });
+      }
+      expect(await inbox.next()).toEqual({ status: "unauthorised" });
+      expect(inbox.accepted()).toBe(false);
+    });
+  });
+
+  it("refuses a GET to the notifications path", async () => {
+    await withListener(async (signer) => {
+      const answer = await fetch(
+        `http://127.0.0.1:${keyPort}${LISTENER_NOTIFICATIONS_PATH}?invocation_id=${signer.invocationId}`,
+      );
+      expect(answer.status).toBe(404);
+    });
   });
 });

@@ -82,6 +82,43 @@ describe("latestVersion", () => {
     expect(await latestVersion(fetchFn)).toBe("0.2.1");
   });
 
+  it("follows a renamed repository's redirect to the new name's latest release", async () => {
+    const asked: string[] = [];
+    const fetchFn = (async (url: string) => {
+      asked.push(url);
+      const location = url === `${REPOSITORY_URL}/releases/latest`
+        ? "https://github.com/usevaris/renamed/releases/latest"
+        : "https://github.com/usevaris/renamed/releases/tag/v1.1.0";
+      return new Response(null, { status: 301, headers: { location } });
+    }) as typeof fetch;
+
+    expect(await latestVersion(fetchFn)).toBe("1.1.0");
+    expect(asked).toEqual([
+      `${REPOSITORY_URL}/releases/latest`,
+      "https://github.com/usevaris/renamed/releases/latest",
+    ]);
+  });
+
+  it("gives up on a redirect loop, or a redirect off GitHub", async () => {
+    let asked = 0;
+    const loop = (async () => {
+      asked++;
+      return new Response(null, {
+        status: 301,
+        headers: { location: `https://github.com/usevaris/loop${asked}/releases/latest` },
+      });
+    }) as typeof fetch;
+    expect(await latestVersion(loop)).toBeNull();
+    expect(asked).toBe(4);
+
+    const elsewhere = (async () =>
+      new Response(null, {
+        status: 301,
+        headers: { location: "https://example.com/usevaris/cli/releases/latest" },
+      })) as typeof fetch;
+    expect(await latestVersion(elsewhere)).toBeNull();
+  });
+
   it("is null when there's no full release, which redirects to /releases", async () => {
     const fetchFn = (async () =>
       new Response(null, { status: 302, headers: { location: `${REPOSITORY_URL}/releases` } })) as typeof fetch;
