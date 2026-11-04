@@ -223,9 +223,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       VERSION: ${{ needs.validate.outputs.version }}
-      # The first release whose varis upgrade works. An older copy runs its
-      # own, older command, which is the stub.
-      FIRST_UPGRADABLE: "0.3.0"
+      # The first release whose varis upgrade can find releases under the
+      # renamed repository. Older copies stop at the repository redirect.
+      FIRST_UPGRADABLE: "1.1.0"
     steps:
       - uses: actions/checkout@v7
 
