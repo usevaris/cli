@@ -65,6 +65,23 @@ const defaultDeps = (): LoginDeps => ({
 
 /** RFC 8628's default, when the server doesn't say. */
 const DEFAULT_INTERVAL_SECONDS = 5;
+/**
+ * The polling interval comes from the server, so it is clamped before it is
+ * used. Zero or a negative value makes sleep return at once and the CLI polls
+ * the token endpoint in a tight loop; a very large one sleeps past the code's
+ * own expiry.
+ */
+const MIN_INTERVAL_SECONDS = 1;
+const MAX_INTERVAL_SECONDS = 60;
+
+/** The server's interval, within bounds, or `fallback` when it sends none. */
+function clampInterval(seconds: unknown, fallback: number): number {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return fallback;
+  return Math.min(
+    Math.max(seconds, MIN_INTERVAL_SECONDS),
+    MAX_INTERVAL_SECONDS,
+  );
+}
 
 export async function runLogin(
   args: string[],
@@ -111,11 +128,14 @@ export async function runLogin(
   output.err("");
 
   const deadline = deps.now() + code.expires_in * 1000;
-  let interval = code.interval || DEFAULT_INTERVAL_SECONDS;
+  let interval = clampInterval(code.interval, DEFAULT_INTERVAL_SECONDS);
   let reportedTrouble = false;
 
   while (deps.now() < deadline) {
     await deps.sleep(interval * 1000);
+    // The code can expire while this sleep runs, and polling with a dead
+    // code only earns an expired_token.
+    if (deps.now() >= deadline) break;
 
     output.status("Checking for approval…");
     const polled = await deps.request<DeviceToken>(
@@ -140,14 +160,12 @@ export async function runLogin(
 
     switch (error.code) {
       case "authorization_pending":
-        if (typeof serverInterval === "number") interval = serverInterval;
+        interval = clampInterval(serverInterval, interval);
         output.status(pendingMessage());
         continue;
       case "slow_down":
         // RFC 8628: add 5 seconds, unless the server says exactly how long.
-        interval = typeof serverInterval === "number"
-          ? serverInterval
-          : interval + 5;
+        interval = clampInterval(serverInterval, interval + 5);
         output.status(pendingMessage());
         continue;
       case "access_denied":
