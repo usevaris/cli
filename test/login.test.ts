@@ -53,7 +53,11 @@ const pollError = (code: string, extra: Record<string, unknown> = {}): ApiResult
  * A scripted server. `polls` answers /v1/cli/device/token in turn; the last
  * answer repeats. Everything else answers from fixed responses.
  */
-function setup(polls: ApiResult<unknown>[], overrides: Partial<LoginDeps> = {}) {
+function setup(
+  polls: ApiResult<unknown>[],
+  overrides: Partial<LoginDeps> = {},
+  code: typeof CODE = CODE,
+) {
   const calls: Call[] = [];
   const slept: number[] = [];
   let clock = 0;
@@ -61,7 +65,7 @@ function setup(polls: ApiResult<unknown>[], overrides: Partial<LoginDeps> = {}) 
 
   const request = (async (method, path, options) => {
     calls.push({ method, path, options });
-    if (path === "/v1/cli/device/code") return { ok: true, status: 200, body: CODE };
+    if (path === "/v1/cli/device/code") return { ok: true, status: 200, body: code };
     if (path === "/v1/cli/device/token") {
       return polls[Math.min(poll++, polls.length - 1)];
     }
@@ -173,6 +177,33 @@ describe("varis login", () => {
     const t = setup([pollError("slow_down"), approved]);
     await runLogin([], t.output, t.deps);
     expect(t.slept).toEqual([5000, 10000]);
+  });
+
+  it("floors an interval the server sends below one second", async () => {
+    const t = setup([approved], {}, { ...CODE, interval: -1 });
+    await runLogin([], t.output, t.deps);
+    expect(t.slept).toEqual([1000]);
+  });
+
+  it("caps an interval the server sends above a minute", async () => {
+    const t = setup([approved], {}, { ...CODE, interval: 86_400 });
+    await runLogin([], t.output, t.deps);
+    expect(t.slept).toEqual([60_000]);
+  });
+
+  it("floors a zero interval sent with authorization_pending", async () => {
+    const t = setup([pollError("authorization_pending", { interval: 0 }), approved]);
+    await runLogin([], t.output, t.deps);
+    expect(t.slept).toEqual([5000, 1000]);
+  });
+
+  it("does not poll with a code that expired while it slept", async () => {
+    const t = setup([approved], {}, { ...CODE, expires_in: 30, interval: 60 });
+
+    expect(await runLogin([], t.output, t.deps)).toBe(1);
+    expect(t.slept).toEqual([60_000]);
+    expect(t.calls.filter((c) => c.path === "/v1/cli/device/token")).toHaveLength(0);
+    expect(t.err.at(-1)).toContain("The code expired");
   });
 
   it("stops on denial, saving nothing", async () => {
